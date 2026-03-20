@@ -1,6 +1,22 @@
 [package]
 name = "nut"
+version.workspace = true
+edition.workspace = true
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["macros"]
+
 [dependencies]
+ndarray = { version = "0.17.2", optional = true }
+num-traits = "0.2.19"
+nut-macros = { workspace.version = true , path = "macros" }
+rand = "0.10.0"
+rand_distr = "0.6.0"
+
+[features]
+default = ["ndarray"]
+ndarray = ["dep:ndarray"]

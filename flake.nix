@@ -40,8 +40,7 @@
           LIBCLANG_PATH = pkgs.lib.makeLibraryPath [ pkgs.llvmPackages_18.libclang.lib ];
 
           shellHook = ''
-            export PATH=$PATH:''${CARGO_HOME:-~/.cargo}/bin
-            exec zsh
+            exec nu
           '';
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (buildInputs ++ nativeBuildInputs);
