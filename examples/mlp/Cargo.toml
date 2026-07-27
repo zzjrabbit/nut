@@ -1,0 +1,11 @@
+[package]
+name = "nut-mlp-example"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+nut = { path = "../.." }
+
+[build-dependencies]
+nut = { path = "../.." }

@@ -1,8 +1,9 @@
-use std::ops::{Add, Deref, Mul, Sub};
+use std::ops::{Add, Mul, Sub};
+
+use num_traits::Num;
 
 #[cfg(feature = "ndarray")]
 pub use nda::NdTensor;
-use num_traits::Num;
 
 #[cfg(feature = "ndarray")]
 mod nda;
@@ -22,47 +23,89 @@ impl DType for isize {}
 impl DType for f32 {}
 impl DType for f64 {}
 
+#[cfg(feature = "ndarray")]
+#[derive(Clone, Debug)]
 pub struct Tensor<T: DType> {
-    #[cfg(feature = "ndarray")]
     inner: NdTensor<T>,
 }
 
 #[cfg(feature = "ndarray")]
-mod _tensor {
-    use crate::tensor::{DType, NdTensor, Tensor, TensorNew, TensorRandn, TensorRandom};
-
-    impl<T: DType> Tensor<T> {
-        pub fn new_zero(shape: &[usize]) -> Self {
-            Self {
-                inner: NdTensor::new_zero(shape),
-            }
+impl<T: DType> Tensor<T> {
+    pub fn new_zero(shape: &[usize]) -> Self {
+        Self {
+            inner: NdTensor::new_zero(shape),
         }
     }
 
-    impl<T: DType> TensorRandn for Tensor<T> {
-        pub fn randn(shape: &[usize]) -> Self {
-            Self {
-                inner: NdTensor::randn(shape),
-            }
+    pub fn from_vec(shape: &[usize], values: Vec<T>) -> Result<Self, TensorError> {
+        Ok(Self {
+            inner: NdTensor::from_vec(shape, values)
+                .map_err(|error| TensorError::InvalidShape(error.to_string()))?,
+        })
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        self.inner.shape()
+    }
+
+    pub fn to_vec(&self) -> Vec<T> {
+        self.inner.to_vec()
+    }
+}
+
+#[cfg(feature = "ndarray")]
+impl Tensor<f32> {
+    pub fn random(shape: &[usize]) -> Self {
+        Self {
+            inner: NdTensor::random(shape),
         }
     }
 
-    impl<T: DType> TensorRandom for Tensor<T> {
-        pub fn random(shape: &[usize]) -> Self {
-            Self {
-                inner: NdTensor::random(shape),
-            }
+    pub fn randn(shape: &[usize]) -> Self {
+        Self {
+            inner: NdTensor::randn(shape),
+        }
+    }
+
+    pub fn matmul(&self, rhs: &Self) -> Self {
+        Self {
+            inner: self.inner.matmul(&rhs.inner),
+        }
+    }
+
+    pub fn add_tensor(&self, rhs: &Self) -> Self {
+        Self {
+            inner: self.inner.add_tensor(&rhs.inner),
+        }
+    }
+
+    pub fn relu(&self) -> Self {
+        Self {
+            inner: self.inner.relu(),
+        }
+    }
+
+    pub fn sigmoid(&self) -> Self {
+        Self {
+            inner: self.inner.sigmoid(),
         }
     }
 }
 
-impl<T: DType> Deref for Tensor<T> {
-    type Target = NdTensor<T>;
+#[derive(Debug)]
+pub enum TensorError {
+    InvalidShape(String),
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+impl std::fmt::Display for TensorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidShape(error) => write!(formatter, "invalid tensor shape: {error}"),
+        }
     }
 }
+
+impl std::error::Error for TensorError {}
 
 pub trait TensorOps: Add + Sub + Mul + Sized + Clone {
     fn shape(&self) -> &[usize];

@@ -39,10 +39,6 @@
           # https://github.com/rust-lang/rust-bindgen#environment-variables
           LIBCLANG_PATH = pkgs.lib.makeLibraryPath [ pkgs.llvmPackages_18.libclang.lib ];
 
-          shellHook = ''
-            exec nu
-          '';
-
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (buildInputs ++ nativeBuildInputs);
 
           # Add glibc, clang, glib, and other headers to bindgen search path

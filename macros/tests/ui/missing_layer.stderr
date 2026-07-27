@@ -1,0 +1,5 @@
+error: every model field requires #[layer(...)]
+ --> tests/ui/missing_layer.rs:5:5
+  |
+5 |     output: Linear,
+  |     ^^^^^^^^^^^^^^

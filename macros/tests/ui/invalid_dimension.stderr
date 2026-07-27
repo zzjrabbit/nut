@@ -1,0 +1,5 @@
+error: in_dim must be a non-negative integer
+ --> tests/ui/invalid_dimension.rs:3:18
+  |
+3 | #[model(in_dim = "ten", out_dim = 1)]
+  |                  ^^^^^
