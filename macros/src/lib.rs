@@ -40,6 +40,7 @@ fn expand_model(arguments: TokenStream2, item: ItemStruct) -> syn::Result<TokenS
     let in_dim = required_usize(&model_attributes, "in_dim")?;
     let out_dim = required_usize(&model_attributes, "out_dim")?;
     validate_loss_attribute(&model_attributes)?;
+    validate_optimizer_attribute(&model_attributes)?;
     let model_attribute_tokens = attributes_to_tokens(&model_attributes)?;
 
     let mut layer_steps = Vec::new();
@@ -193,6 +194,45 @@ fn validate_loss_attribute(attributes: &Punctuated<Meta, Token![,]>) -> syn::Res
             return Err(syn::Error::new_spanned(
                 value,
                 "unsupported loss; expected \"mse\", \"binary_cross_entropy\", or \"categorical_cross_entropy\"",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_optimizer_attribute(attributes: &Punctuated<Meta, Token![,]>) -> syn::Result<()> {
+    let mut found = false;
+    for attribute in attributes {
+        if !attribute.path().is_ident("optimizer") {
+            continue;
+        }
+        if found {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "duplicate model attribute \"optimizer\"",
+            ));
+        }
+        found = true;
+        let Meta::NameValue(value) = attribute else {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "optimizer must be a string",
+            ));
+        };
+        let Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) = &value.value
+        else {
+            return Err(syn::Error::new_spanned(
+                &value.value,
+                "optimizer must be a string",
+            ));
+        };
+        if TrainingOptimizer::parse(&value.value()).is_none() {
+            return Err(syn::Error::new_spanned(
+                value,
+                "unsupported optimizer; expected \"sgd\" or \"adam\"",
             ));
         }
     }
@@ -528,6 +568,7 @@ fn generate_trainable_model(
         ));
     }
     let loss = graph_training_loss(&graph, span)?;
+    let optimizer = graph_training_optimizer(&graph, span)?;
 
     let model_ident = &structure.ident;
     let visibility = &structure.vis;
@@ -537,6 +578,7 @@ fn generate_trainable_model(
     let mut initializers = Vec::new();
     let mut computations = Vec::new();
     let mut parameter_fields = BTreeMap::new();
+    let mut adam_states = BTreeMap::new();
 
     for (index, node) in graph.nodes.iter().enumerate() {
         if node.id as usize != index {
@@ -588,6 +630,19 @@ fn generate_trainable_model(
                 };
                 fields.push(quote! { pub #field: ::nut::Tensor<f32>, });
                 initializers.push(quote! { #field: #initialize, });
+                if matches!(optimizer, TrainingOptimizer::Adam) {
+                    let first_moment = format_ident!("__nut_adam_first_moment_{}", node.id);
+                    let second_moment = format_ident!("__nut_adam_second_moment_{}", node.id);
+                    fields.push(quote! {
+                        #first_moment: ::nut::Tensor<f32>,
+                        #second_moment: ::nut::Tensor<f32>,
+                    });
+                    initializers.push(quote! {
+                        #first_moment: ::nut::Tensor::<f32>::new_zero(&[#(#dimensions),*]),
+                        #second_moment: ::nut::Tensor::<f32>::new_zero(&[#(#dimensions),*]),
+                    });
+                    adam_states.insert(node.id, (first_moment, second_moment));
+                }
                 computations.push(quote! { let #binding = self.#field.clone(); });
                 parameter_fields.insert(node.id, field);
             }
@@ -650,6 +705,20 @@ fn generate_trainable_model(
         }
     }
 
+    let optimizer_step = match optimizer {
+        TrainingOptimizer::Sgd => quote! {},
+        TrainingOptimizer::Adam => {
+            fields.push(quote! { __nut_adam_step: u64, });
+            initializers.push(quote! { __nut_adam_step: 0, });
+            quote! {
+                self.__nut_adam_step = self
+                    .__nut_adam_step
+                    .checked_add(1)
+                    .expect("Adam step counter overflow");
+                let __optimizer_step = self.__nut_adam_step;
+            }
+        }
+    };
     let mut updates = Vec::new();
     for parameter in &graph.parameters {
         let field = parameter_fields.get(parameter).ok_or_else(|| {
@@ -658,9 +727,29 @@ fn generate_trainable_model(
         let gradient = parameter_gradients.get(parameter).ok_or_else(|| {
             syn::Error::new_spanned(span, format!("parameter {parameter} has no gradient"))
         })?;
-        updates.push(quote! {
-            self.#field.subtract_scaled(&#gradient, learning_rate);
-        });
+        match optimizer {
+            TrainingOptimizer::Sgd => updates.push(quote! {
+                self.#field.subtract_scaled(&#gradient, learning_rate);
+            }),
+            TrainingOptimizer::Adam => {
+                let (first_moment, second_moment) =
+                    adam_states.get(parameter).ok_or_else(|| {
+                        syn::Error::new_spanned(
+                            span,
+                            format!("missing Adam state for parameter {parameter}"),
+                        )
+                    })?;
+                updates.push(quote! {
+                    self.#field.adam_update(
+                        &#gradient,
+                        &mut self.#first_moment,
+                        &mut self.#second_moment,
+                        learning_rate,
+                        __optimizer_step,
+                    );
+                });
+            }
+        }
     }
     let loss_and_gradient = match loss {
         TrainingLoss::Mse => quote! { #output.mse_loss_and_gradient(&target) },
@@ -704,6 +793,7 @@ fn generate_trainable_model(
                 #(#computations)*
                 let (__loss, __output_gradient) = #loss_and_gradient;
                 #(#backward)*
+                #optimizer_step
                 #(#updates)*
                 ::nut::TrainStepResult {
                     loss: __loss,
@@ -725,6 +815,22 @@ enum TrainingLoss {
     Mse,
     BinaryCrossEntropy,
     CategoricalCrossEntropy,
+}
+
+#[derive(Clone, Copy)]
+enum TrainingOptimizer {
+    Sgd,
+    Adam,
+}
+
+impl TrainingOptimizer {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "sgd" => Some(Self::Sgd),
+            "adam" => Some(Self::Adam),
+            _ => None,
+        }
+    }
 }
 
 impl TrainingLoss {
@@ -751,6 +857,24 @@ fn graph_training_loss(graph: &GraphArtifact, span: &LitStr) -> syn::Result<Trai
             format!(
                 "unsupported model loss {name:?}; expected \"mse\", \"binary_cross_entropy\", or \"categorical_cross_entropy\""
             ),
+        )
+    })
+}
+
+fn graph_training_optimizer(
+    graph: &GraphArtifact,
+    span: &LitStr,
+) -> syn::Result<TrainingOptimizer> {
+    let Some(value) = graph.attributes.get("optimizer") else {
+        return Ok(TrainingOptimizer::Sgd);
+    };
+    let name = value
+        .as_str()
+        .ok_or_else(|| syn::Error::new_spanned(span, "model optimizer must be a string"))?;
+    TrainingOptimizer::parse(name).ok_or_else(|| {
+        syn::Error::new_spanned(
+            span,
+            format!("unsupported model optimizer {name:?}; expected \"sgd\" or \"adam\""),
         )
     })
 }
@@ -1121,6 +1245,52 @@ mod tests {
             expand_model(quote!(in_dim = 10, out_dim = 1, loss = "unknown"), item).unwrap_err();
 
         assert!(error.to_string().contains("unsupported loss"));
+    }
+
+    #[test]
+    fn model_macro_accepts_adam() {
+        let item = parse_quote! {
+            struct Regressor {
+                #[layer(in_dim = 1, out_dim = 1)]
+                output: Linear,
+            }
+        };
+        let generated = expand_model(quote!(in_dim = 1, out_dim = 1, optimizer = "adam"), item)
+            .unwrap()
+            .to_string();
+
+        assert!(generated.contains("optimizer"));
+        assert!(generated.contains("adam"));
+    }
+
+    #[test]
+    fn model_macro_accepts_explicit_sgd() {
+        let item = parse_quote! {
+            struct Regressor {
+                #[layer(in_dim = 1, out_dim = 1)]
+                output: Linear,
+            }
+        };
+        let generated = expand_model(quote!(in_dim = 1, out_dim = 1, optimizer = "sgd"), item)
+            .unwrap()
+            .to_string();
+
+        assert!(generated.contains("optimizer"));
+        assert!(generated.contains("sgd"));
+    }
+
+    #[test]
+    fn model_macro_rejects_an_unsupported_optimizer() {
+        let item = parse_quote! {
+            struct Regressor {
+                #[layer(in_dim = 1, out_dim = 1)]
+                output: Linear,
+            }
+        };
+        let error =
+            expand_model(quote!(in_dim = 1, out_dim = 1, optimizer = "unknown"), item).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported optimizer"));
     }
 
     #[test]

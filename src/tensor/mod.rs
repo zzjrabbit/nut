@@ -189,6 +189,23 @@ impl Tensor<f32> {
     pub fn subtract_scaled(&mut self, gradient: &Self, factor: f32) {
         self.inner.subtract_scaled(&gradient.inner, factor);
     }
+
+    pub fn adam_update(
+        &mut self,
+        gradient: &Self,
+        first_moment: &mut Self,
+        second_moment: &mut Self,
+        learning_rate: f32,
+        step: u64,
+    ) {
+        self.inner.adam_update(
+            &gradient.inner,
+            &mut first_moment.inner,
+            &mut second_moment.inner,
+            learning_rate,
+            step,
+        );
+    }
 }
 
 #[derive(Debug)]

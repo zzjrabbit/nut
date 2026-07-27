@@ -65,9 +65,16 @@ struct BranchModel {
     shared: SharedBias,
 }
 
+#[model(in_dim = 2, out_dim = 1, optimizer = "adam")]
+struct AdamRegressor {
+    #[layer(in_dim = 2, out_dim = 1)]
+    output: Linear,
+}
+
 fn main() {
     Mlp::write_graph("mlp.nut.json").expect("failed to generate MLP graph");
     MulticlassClassifier::write_graph("multiclass.nut.json")
         .expect("failed to generate multiclass classifier graph");
     BranchModel::write_graph("branch.nut.json").expect("failed to generate branch model graph");
+    AdamRegressor::write_graph("adam.nut.json").expect("failed to generate Adam regressor graph");
 }

@@ -365,6 +365,61 @@ impl NdTensor<f32> {
         assert_eq!(self.inner.shape(), gradient.inner.shape());
         self.inner = (&self.inner - &gradient.inner.mapv(|value| value * factor)).into_shared();
     }
+
+    pub(crate) fn adam_update(
+        &mut self,
+        gradient: &Self,
+        first_moment: &mut Self,
+        second_moment: &mut Self,
+        learning_rate: f32,
+        step: u64,
+    ) {
+        const BETA_1: f32 = 0.9;
+        const BETA_2: f32 = 0.999;
+        const EPSILON: f32 = 1e-8;
+
+        assert_eq!(
+            self.inner.shape(),
+            gradient.inner.shape(),
+            "Adam parameter and gradient shapes must match",
+        );
+        assert_eq!(
+            self.inner.shape(),
+            first_moment.inner.shape(),
+            "Adam parameter and first moment shapes must match",
+        );
+        assert_eq!(
+            self.inner.shape(),
+            second_moment.inner.shape(),
+            "Adam parameter and second moment shapes must match",
+        );
+        assert!(
+            learning_rate.is_finite() && learning_rate >= 0.0,
+            "learning rate must be finite and non-negative",
+        );
+        assert!(step > 0, "Adam step must be positive");
+
+        first_moment.inner =
+            (&first_moment.inner * BETA_1 + &gradient.inner * (1.0 - BETA_1)).into_shared();
+        second_moment.inner = (&second_moment.inner * BETA_2
+            + gradient.inner.mapv(|value| value * value) * (1.0 - BETA_2))
+            .into_shared();
+
+        let step = step as f32;
+        let first_correction = 1.0 - BETA_1.powf(step);
+        let second_correction = 1.0 - BETA_2.powf(step);
+        let direction = first_moment
+            .inner
+            .iter()
+            .zip(second_moment.inner.iter())
+            .map(|(first, second)| {
+                (first / first_correction) / ((second / second_correction).sqrt() + EPSILON)
+            })
+            .collect::<ndarray::Array1<_>>()
+            .into_shape_with_order(self.inner.raw_dim())
+            .expect("Adam update shape is unchanged");
+        self.inner = (&self.inner - &(direction * learning_rate)).into_shared();
+    }
 }
 
 impl<T: DType> TensorOps for NdTensor<T> {
@@ -436,6 +491,49 @@ mod tests {
         let bias = NdTensor::from_vec(&[2], vec![1.0, 1.0]).unwrap();
         let output = input.matmul(&weights).add_tensor(&bias).relu();
         assert_eq!(output.to_vec(), vec![3.0, 0.0]);
+    }
+
+    #[test]
+    fn adam_update_tracks_moments_and_applies_bias_correction() {
+        let mut parameter = NdTensor::from_vec(&[2], vec![1.0, 1.0]).unwrap();
+        let gradient = NdTensor::from_vec(&[2], vec![1.0, -2.0]).unwrap();
+        let mut first_moment = NdTensor::new_zero(&[2]);
+        let mut second_moment = NdTensor::new_zero(&[2]);
+
+        parameter.adam_update(&gradient, &mut first_moment, &mut second_moment, 0.1, 1);
+
+        let parameter_values = parameter.to_vec();
+        assert!((parameter_values[0] - 0.9).abs() < 1e-6);
+        assert!((parameter_values[1] - 1.1).abs() < 1e-6);
+        let first_values = first_moment.to_vec();
+        assert!((first_values[0] - 0.1).abs() < 1e-6);
+        assert!((first_values[1] + 0.2).abs() < 1e-6);
+        let second_values = second_moment.to_vec();
+        assert!((second_values[0] - 0.001).abs() < 1e-7);
+        assert!((second_values[1] - 0.004).abs() < 1e-7);
+
+        parameter.adam_update(&gradient, &mut first_moment, &mut second_moment, 0.1, 2);
+
+        let parameter_values = parameter.to_vec();
+        assert!((parameter_values[0] - 0.8).abs() < 1e-5);
+        assert!((parameter_values[1] - 1.2).abs() < 1e-5);
+    }
+
+    #[test]
+    #[should_panic(expected = "learning rate must be finite and non-negative")]
+    fn adam_update_rejects_an_invalid_learning_rate() {
+        let mut parameter = NdTensor::from_vec(&[1], vec![1.0]).unwrap();
+        let gradient = NdTensor::from_vec(&[1], vec![1.0]).unwrap();
+        let mut first_moment = NdTensor::new_zero(&[1]);
+        let mut second_moment = NdTensor::new_zero(&[1]);
+
+        parameter.adam_update(
+            &gradient,
+            &mut first_moment,
+            &mut second_moment,
+            f32::NAN,
+            1,
+        );
     }
 
     #[test]

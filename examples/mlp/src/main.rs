@@ -7,6 +7,9 @@ struct MulticlassClassifier;
 #[nut::include_model("branch.nut.json")]
 struct BranchModel;
 
+#[nut::include_model("adam.nut.json")]
+struct AdamRegressor;
+
 fn main() {
     let mut model = Mlp::new();
     let input = nut::Tensor::from_vec(&[2, 10], vec![1.0; 20]).unwrap();
@@ -49,6 +52,13 @@ mod tests {
             output_weight: nut::Tensor::new_zero(&[2, 3]),
             output_bias: nut::Tensor::new_zero(&[3]),
         }
+    }
+
+    fn controlled_adam_model() -> AdamRegressor {
+        let mut model = AdamRegressor::new();
+        model.output_weight = nut::Tensor::new_zero(&[2, 1]);
+        model.output_bias = nut::Tensor::new_zero(&[1]);
+        model
     }
 
     fn multiclass_training_data() -> (nut::Tensor<f32>, nut::Tensor<f32>) {
@@ -108,6 +118,29 @@ mod tests {
             final_loss < initial_loss * 0.1,
             "loss did not converge: {initial_loss} -> {final_loss}"
         );
+    }
+
+    #[test]
+    fn generated_adam_model_tracks_state_and_reduces_loss() {
+        let mut model = controlled_adam_model();
+        let input = nut::Tensor::from_vec(&[1, 2], vec![1.0, 0.0]).unwrap();
+        let target = nut::Tensor::from_vec(&[1, 1], vec![1.0]).unwrap();
+
+        let first = model.train_step(input.clone(), target.clone(), 0.1);
+        assert!((first.loss - 1.0).abs() < 1e-6);
+        assert_eq!(first.output.to_vec(), vec![0.0]);
+        assert!((model.output_weight.to_vec()[0] - 0.1).abs() < 1e-5);
+        assert!((model.output_bias.to_vec()[0] - 0.1).abs() < 1e-5);
+
+        model.train_step(input.clone(), target.clone(), 0.1);
+        assert!(model.output_weight.to_vec()[0] > 0.19);
+        assert!(model.output_bias.to_vec()[0] > 0.19);
+
+        for _ in 0..100 {
+            model.train_step(input.clone(), target.clone(), 0.05);
+        }
+        let final_loss = model.forward(input).mse_loss_and_gradient(&target).0;
+        assert!(final_loss < 1e-4, "Adam did not converge: {final_loss}");
     }
 
     #[test]

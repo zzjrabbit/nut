@@ -12,12 +12,12 @@ basic training:
 2. The generator runs in `build.rs`, validates and optimizes the graph, and
    writes a versioned JSON artifact to `OUT_DIR`.
 3. `#[include_model]` reads that artifact during compilation and generates model
-   parameters, `forward`, reverse-mode gradients, and an SGD training step.
+   parameters, `forward`, reverse-mode gradients, and a training step.
 
 Training currently supports MSE, binary cross-entropy, or categorical
-cross-entropy loss and SGD for graphs built from `MatMul`, `Add`, `Relu`,
-`Sigmoid`, and `Softmax`. More losses, optimizers, and graph-level performance
-optimizations are not implemented yet.
+cross-entropy loss and either SGD or Adam for graphs built from `MatMul`, `Add`,
+`Relu`, `Sigmoid`, and `Softmax`. More losses, optimizers, and graph-level
+performance optimizations are not implemented yet.
 
 ## Example
 
@@ -75,6 +75,21 @@ fn main() {
 the loss, so calculating metrics does not require another forward pass. The
 provided `binary_accuracy` helper uses `0.5` as the class boundary.
 
+SGD is the default optimizer. Select Adam in the model declaration while
+keeping the same `train_step` API:
+
+```rust
+#[model(in_dim = 10, out_dim = 1, optimizer = "adam")]
+struct Regressor {
+    #[layer(in_dim = 10, out_dim = 1)]
+    output: Linear,
+}
+```
+
+Adam uses β₁ = 0.9, β₂ = 0.999, and ε = 1e-8. Its first- and second-moment
+state is initialized by the generated model's `new` method and preserved by
+`Clone`.
+
 For multiclass classification, select categorical cross-entropy and finish the
 model with a `softmax` layer:
 
@@ -130,8 +145,9 @@ artifact schema changes, rather than for an operator-only addition.
   cross entropy expects at least two classes and finite output and target
   distributions that sum to one along the last dimension, making it suitable
   for a final `Softmax` layer.
-- Training uses an in-place SGD update. The learning rate must be finite and
-  non-negative.
+- Training uses an in-place SGD update by default. `optimizer = "adam"` enables
+  Adam with bias correction. In both cases, the learning rate must be finite
+  and non-negative.
 - Runtime `MatMul` is two-dimensional. `Add` follows `ndarray` broadcasting,
   and its generated gradient reduces back to each input shape. `Softmax`
   operates along the last dimension.
