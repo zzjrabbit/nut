@@ -461,7 +461,7 @@ impl Graph {
                 }
                 return Ok(());
             }
-            "Relu" | "Sigmoid" => {
+            "Relu" | "Sigmoid" | "Softmax" => {
                 let [input] = input_shapes.as_slice() else {
                     return Err(GraphError::invalid(format!(
                         "operator {:?} requires exactly one input",
@@ -599,14 +599,14 @@ impl Graph {
 fn supports_gradient(operator: &str) -> bool {
     matches!(
         operator,
-        "Input" | "Parameter" | "MatMul" | "Add" | "Relu" | "Sigmoid"
+        "Input" | "Parameter" | "MatMul" | "Add" | "Relu" | "Sigmoid" | "Softmax"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Layer, LayerConfig, Linear};
+    use crate::{Layer, LayerConfig, Linear, Softmax};
 
     fn graph_with_dead_node() -> Graph {
         let mut graph = Graph::named("test");
@@ -782,6 +782,41 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn softmax_preserves_shape_and_supports_training() {
+        let mut graph = Graph::named("Classifier");
+        let input = graph.add_input("input", Shape::new(vec![3]));
+        let parameter = graph
+            .add_parameter(
+                "bias",
+                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Shape::new(vec![3]),
+            )
+            .unwrap();
+        let logits = graph
+            .add_node(
+                "logits",
+                Operator::new("Add"),
+                vec![input, parameter],
+                Shape::new(vec![3]),
+            )
+            .unwrap();
+        let output = Softmax::build(
+            &mut graph,
+            "probabilities",
+            &[logits],
+            &LayerConfig::new().with("foreach", true),
+        )
+        .unwrap();
+        graph.set_outputs(output).unwrap();
+
+        graph.prepare_training().unwrap();
+
+        let output = graph.node(graph.outputs()[0]).unwrap();
+        assert_eq!(output.operator().name(), "Softmax");
+        assert_eq!(output.shape().dimensions(), &[3]);
     }
 
     #[test]

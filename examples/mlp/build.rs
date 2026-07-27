@@ -1,4 +1,4 @@
-use nut::{Linear, model, relu, sigmoid};
+use nut::{Linear, model, relu, sigmoid, softmax};
 
 struct SharedBias;
 
@@ -51,6 +51,14 @@ struct Mlp {
     f3: sigmoid,
 }
 
+#[model(in_dim = 2, out_dim = 3, loss = "categorical_cross_entropy")]
+struct MulticlassClassifier {
+    #[layer(in_dim = 2, out_dim = 3)]
+    output: Linear,
+    #[layer(foreach)]
+    probabilities: softmax,
+}
+
 #[model(in_dim = 1, out_dim = 1)]
 struct BranchModel {
     #[layer(shared)]
@@ -59,5 +67,7 @@ struct BranchModel {
 
 fn main() {
     Mlp::write_graph("mlp.nut.json").expect("failed to generate MLP graph");
+    MulticlassClassifier::write_graph("multiclass.nut.json")
+        .expect("failed to generate multiclass classifier graph");
     BranchModel::write_graph("branch.nut.json").expect("failed to generate branch model graph");
 }

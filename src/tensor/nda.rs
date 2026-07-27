@@ -66,6 +66,36 @@ impl NdTensor<f32> {
         )
     }
 
+    pub(crate) fn softmax(&self) -> Self {
+        assert!(
+            self.inner.ndim() > 0,
+            "softmax requires at least one dimension"
+        );
+        assert!(
+            self.inner.shape().last().copied().unwrap_or(0) > 0,
+            "softmax requires a non-empty last dimension"
+        );
+        assert!(
+            self.inner.iter().all(|value| value.is_finite()),
+            "softmax requires finite input values"
+        );
+
+        let axis = Axis(self.inner.ndim() - 1);
+        let mut output = self.inner.to_owned();
+        for mut lane in output.lanes_mut(axis) {
+            let maximum = lane.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut total = 0.0;
+            for value in &mut lane {
+                *value = (*value - maximum).exp();
+                total += *value;
+            }
+            for value in &mut lane {
+                *value /= total;
+            }
+        }
+        Self::from_inner(output.into_shared())
+    }
+
     pub(crate) fn transpose_2d(&self) -> Self {
         let matrix = self
             .inner
@@ -108,6 +138,40 @@ impl NdTensor<f32> {
         assert_eq!(self.inner.shape(), gradient.inner.shape());
         let local = self.inner.mapv(|value| value * (1.0 - value));
         Self::from_inner((local * &gradient.inner).into_shared())
+    }
+
+    pub(crate) fn softmax_backward(&self, gradient: &Self) -> Self {
+        assert_eq!(
+            self.inner.shape(),
+            gradient.inner.shape(),
+            "softmax backward requires output and gradient to have the same shape",
+        );
+        assert!(
+            self.inner.ndim() > 0,
+            "softmax backward requires at least one dimension"
+        );
+        let axis = Axis(self.inner.ndim() - 1);
+        let mut result = gradient.inner.to_owned();
+        for ((mut result_lane, probability_lane), gradient_lane) in result
+            .lanes_mut(axis)
+            .into_iter()
+            .zip(self.inner.lanes(axis))
+            .zip(gradient.inner.lanes(axis))
+        {
+            let dot = probability_lane
+                .iter()
+                .zip(gradient_lane.iter())
+                .map(|(probability, gradient)| probability * gradient)
+                .sum::<f32>();
+            for ((result, probability), gradient) in result_lane
+                .iter_mut()
+                .zip(probability_lane.iter())
+                .zip(gradient_lane.iter())
+            {
+                *result = probability * (gradient - dot);
+            }
+        }
+        Self::from_inner(result.into_shared())
     }
 
     pub(crate) fn mse_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
@@ -168,6 +232,27 @@ impl NdTensor<f32> {
         (loss, Self::from_inner(gradient))
     }
 
+    pub(crate) fn categorical_cross_entropy_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
+        let class_count = self.validate_categorical_target(target, "categorical cross entropy");
+        let sample_count = self.inner.len() / class_count;
+        let probabilities = self.inner.mapv(|value| value.clamp(f32::EPSILON, 1.0));
+        let loss = probabilities
+            .iter()
+            .zip(target.inner.iter())
+            .map(|(output, target)| -target * output.ln())
+            .sum::<f32>()
+            / sample_count as f32;
+        let gradient = probabilities
+            .iter()
+            .zip(target.inner.iter())
+            .map(|(output, target)| -target / (output * sample_count as f32))
+            .collect::<ndarray::Array1<_>>()
+            .into_shape_with_order(self.inner.raw_dim())
+            .expect("categorical cross entropy gradient shape is unchanged")
+            .into_shared();
+        (loss, Self::from_inner(gradient))
+    }
+
     pub(crate) fn binary_accuracy(&self, target: &Self) -> f32 {
         assert_eq!(
             self.inner.shape(),
@@ -185,6 +270,91 @@ impl NdTensor<f32> {
             .filter(|(output, target)| (**output >= 0.5) == (**target >= 0.5))
             .count();
         correct as f32 / self.inner.len() as f32
+    }
+
+    pub(crate) fn categorical_accuracy(&self, target: &Self) -> f32 {
+        self.validate_categorical_target(target, "categorical accuracy");
+        let axis = Axis(self.inner.ndim() - 1);
+        let mut correct = 0usize;
+        let mut sample_count = 0usize;
+        for (output, target) in self
+            .inner
+            .lanes(axis)
+            .into_iter()
+            .zip(target.inner.lanes(axis))
+        {
+            let output_class = output
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index)
+                .expect("categorical output lane is non-empty");
+            let target_class = target
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index)
+                .expect("categorical target lane is non-empty");
+            correct += usize::from(output_class == target_class);
+            sample_count += 1;
+        }
+        correct as f32 / sample_count as f32
+    }
+
+    fn validate_categorical_target(&self, target: &Self, operation: &str) -> usize {
+        assert_eq!(
+            self.inner.shape(),
+            target.inner.shape(),
+            "{operation} requires output and target to have the same shape",
+        );
+        assert!(
+            self.inner.ndim() > 0,
+            "{operation} requires at least one dimension"
+        );
+        let class_count = *self
+            .inner
+            .shape()
+            .last()
+            .expect("categorical tensor has a last dimension");
+        assert!(
+            class_count >= 2,
+            "{operation} requires at least two classes"
+        );
+        assert!(
+            !self.inner.is_empty(),
+            "{operation} requires at least one sample"
+        );
+        assert!(
+            self.inner
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+            "{operation} requires finite output values in [0, 1]",
+        );
+        assert!(
+            target
+                .inner
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+            "{operation} requires finite target values in [0, 1]",
+        );
+
+        let axis = Axis(self.inner.ndim() - 1);
+        assert!(
+            self.inner
+                .lanes(axis)
+                .into_iter()
+                .all(|lane| (lane.sum() - 1.0).abs() <= 1e-5),
+            "{operation} requires each output distribution to sum to one",
+        );
+        assert!(
+            target
+                .inner
+                .lanes(axis)
+                .into_iter()
+                .all(|lane| (lane.sum() - 1.0).abs() <= 1e-5),
+            "{operation} requires each target distribution to sum to one",
+        );
+        class_count
     }
 
     pub(crate) fn scale(&self, factor: f32) -> Self {
@@ -298,6 +468,84 @@ mod tests {
 
         assert!(loss.is_finite());
         assert!(gradient.to_vec().into_iter().all(f32::is_finite));
+    }
+
+    #[test]
+    fn softmax_is_stable_and_normalizes_each_sample() {
+        let logits =
+            NdTensor::from_vec(&[2, 3], vec![1000.0, 1001.0, 1002.0, 1.0, 1.0, 1.0]).unwrap();
+
+        let output = logits.softmax();
+        let values = output.to_vec();
+
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!((values[0] - 0.090_030_57).abs() < 1e-6);
+        assert!((values[1] - 0.244_728_48).abs() < 1e-6);
+        assert!((values[2] - 0.665_240_94).abs() < 1e-6);
+        assert!((values[..3].iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((values[3..].iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn softmax_backward_matches_finite_difference() {
+        let values = vec![0.2, -0.1, 0.4];
+        let upstream = NdTensor::from_vec(&[3], vec![0.3, -0.2, 0.7]).unwrap();
+        let output = NdTensor::from_vec(&[3], values.clone()).unwrap().softmax();
+        let analytical = output.softmax_backward(&upstream).to_vec();
+        let epsilon = 1e-3;
+
+        for index in 0..values.len() {
+            let mut plus = values.clone();
+            plus[index] += epsilon;
+            let plus = NdTensor::from_vec(&[3], plus)
+                .unwrap()
+                .softmax()
+                .to_vec()
+                .into_iter()
+                .zip(upstream.to_vec())
+                .map(|(output, gradient)| output * gradient)
+                .sum::<f32>();
+            let mut minus = values.clone();
+            minus[index] -= epsilon;
+            let minus = NdTensor::from_vec(&[3], minus)
+                .unwrap()
+                .softmax()
+                .to_vec()
+                .into_iter()
+                .zip(upstream.to_vec())
+                .map(|(output, gradient)| output * gradient)
+                .sum::<f32>();
+            let numerical = (plus - minus) / (2.0 * epsilon);
+
+            assert!(
+                (analytical[index] - numerical).abs() < 1e-4,
+                "gradient mismatch at {index}: {} != {numerical}",
+                analytical[index],
+            );
+        }
+    }
+
+    #[test]
+    fn categorical_cross_entropy_and_accuracy_have_expected_values() {
+        let output = NdTensor::from_vec(&[2, 3], vec![0.7, 0.2, 0.1, 0.1, 0.3, 0.6]).unwrap();
+        let target = NdTensor::from_vec(&[2, 3], vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0]).unwrap();
+
+        let (loss, gradient) = output.categorical_cross_entropy_loss_and_gradient(&target);
+
+        assert!((loss - (-(0.7_f32.ln() + 0.6_f32.ln()) / 2.0)).abs() < 1e-6);
+        assert!((gradient.to_vec()[0] + 1.0 / 1.4).abs() < 1e-6);
+        assert_eq!(output.categorical_accuracy(&target), 1.0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "categorical cross entropy requires each target distribution to sum to one"
+    )]
+    fn categorical_cross_entropy_rejects_invalid_target_distributions() {
+        let output = NdTensor::from_vec(&[1, 3], vec![0.2, 0.3, 0.5]).unwrap();
+        let target = NdTensor::from_vec(&[1, 3], vec![1.0, 1.0, 0.0]).unwrap();
+
+        output.categorical_cross_entropy_loss_and_gradient(&target);
     }
 
     #[test]

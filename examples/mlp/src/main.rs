@@ -1,6 +1,9 @@
 #[nut::include_model("mlp.nut.json")]
 struct Mlp;
 
+#[nut::include_model("multiclass.nut.json")]
+struct MulticlassClassifier;
+
 #[nut::include_model("branch.nut.json")]
 struct BranchModel;
 
@@ -38,6 +41,33 @@ mod tests {
         (
             nut::Tensor::from_vec(&[2, 10], vec![1.0; 20]).unwrap(),
             nut::Tensor::from_vec(&[2, 1], vec![1.0; 2]).unwrap(),
+        )
+    }
+
+    fn controlled_multiclass_model() -> MulticlassClassifier {
+        MulticlassClassifier {
+            output_weight: nut::Tensor::new_zero(&[2, 3]),
+            output_bias: nut::Tensor::new_zero(&[3]),
+        }
+    }
+
+    fn multiclass_training_data() -> (nut::Tensor<f32>, nut::Tensor<f32>) {
+        (
+            nut::Tensor::from_vec(
+                &[6, 2],
+                vec![
+                    2.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 1.0, -2.0, -2.0, -1.0, -1.0,
+                ],
+            )
+            .unwrap(),
+            nut::Tensor::from_vec(
+                &[6, 3],
+                vec![
+                    1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+                    0.0, 1.0,
+                ],
+            )
+            .unwrap(),
         )
     }
 
@@ -119,6 +149,65 @@ mod tests {
         minus.layer3_weight = nut::Tensor::from_vec(&[10, 1], minus_values).unwrap();
         let numerical =
             (loss(&plus, &input, &target) - loss(&minus, &input, &target)) / (2.0 * epsilon);
+
+        assert!(
+            (analytical - numerical).abs() < 2e-3,
+            "gradient mismatch: analytical={analytical}, numerical={numerical}"
+        );
+    }
+
+    #[test]
+    fn generated_multiclass_model_trains_and_reports_accuracy() {
+        let mut model = controlled_multiclass_model();
+        let (input, target) = multiclass_training_data();
+        let initial_loss = model
+            .forward(input.clone())
+            .categorical_cross_entropy_loss_and_gradient(&target)
+            .0;
+
+        let mut result = model.train_step(input.clone(), target.clone(), 0.2);
+        for _ in 1..200 {
+            result = model.train_step(input.clone(), target.clone(), 0.2);
+        }
+
+        assert!(result.loss < initial_loss * 0.1);
+        assert_eq!(result.output.shape(), &[6, 3]);
+        assert_eq!(result.categorical_accuracy(&target), 1.0);
+        let probabilities = result.output.to_vec();
+        for probabilities in probabilities.as_chunks::<3>().0 {
+            assert!((probabilities.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn generated_softmax_gradient_matches_finite_difference() {
+        let model = controlled_multiclass_model();
+        let (input, target) = multiclass_training_data();
+        let learning_rate = 1e-3;
+        let epsilon = 1e-3;
+        let original = model.output_weight.to_vec();
+
+        let mut trained = model.clone();
+        trained.train_step(input.clone(), target.clone(), learning_rate);
+        let analytical = (original[0] - trained.output_weight.to_vec()[0]) / learning_rate;
+
+        let mut plus = model.clone();
+        let mut plus_values = original.clone();
+        plus_values[0] += epsilon;
+        plus.output_weight = nut::Tensor::from_vec(&[2, 3], plus_values).unwrap();
+        let plus_loss = plus
+            .forward(input.clone())
+            .categorical_cross_entropy_loss_and_gradient(&target)
+            .0;
+        let mut minus = model;
+        let mut minus_values = original;
+        minus_values[0] -= epsilon;
+        minus.output_weight = nut::Tensor::from_vec(&[2, 3], minus_values).unwrap();
+        let minus_loss = minus
+            .forward(input)
+            .categorical_cross_entropy_loss_and_gradient(&target)
+            .0;
+        let numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
 
         assert!(
             (analytical - numerical).abs() < 2e-3,

@@ -145,6 +145,19 @@ impl Layer for Sigmoid {
     }
 }
 
+pub struct Softmax;
+
+impl Layer for Softmax {
+    fn build(
+        graph: &mut Graph,
+        name: &str,
+        inputs: &[NodeId],
+        config: &LayerConfig,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        unary(graph, name, inputs, config, "Softmax")
+    }
+}
+
 fn unary(
     graph: &mut Graph,
     name: &str,
@@ -175,3 +188,5 @@ fn unary(
 pub type relu = Relu;
 #[allow(non_camel_case_types)]
 pub type sigmoid = Sigmoid;
+#[allow(non_camel_case_types)]
+pub type softmax = Softmax;

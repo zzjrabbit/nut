@@ -14,9 +14,10 @@ basic training:
 3. `#[include_model]` reads that artifact during compilation and generates model
    parameters, `forward`, reverse-mode gradients, and an SGD training step.
 
-Training currently supports MSE or binary cross-entropy loss and SGD for graphs
-built from `MatMul`, `Add`, `Relu`, and `Sigmoid`. More losses, optimizers, and
-graph-level performance optimizations are not implemented yet.
+Training currently supports MSE, binary cross-entropy, or categorical
+cross-entropy loss and SGD for graphs built from `MatMul`, `Add`, `Relu`,
+`Sigmoid`, and `Softmax`. More losses, optimizers, and graph-level performance
+optimizations are not implemented yet.
 
 ## Example
 
@@ -74,6 +75,25 @@ fn main() {
 the loss, so calculating metrics does not require another forward pass. The
 provided `binary_accuracy` helper uses `0.5` as the class boundary.
 
+For multiclass classification, select categorical cross-entropy and finish the
+model with a `softmax` layer:
+
+```rust
+use nut::{Linear, model, softmax};
+
+#[model(in_dim = 10, out_dim = 3, loss = "categorical_cross_entropy")]
+struct Classifier {
+    #[layer(in_dim = 10, out_dim = 3)]
+    output: Linear,
+    #[layer(foreach)]
+    probabilities: softmax,
+}
+```
+
+Targets have the same shape as the output and contain a probability
+distribution for each sample, such as one-hot labels. Use
+`TrainStepResult::categorical_accuracy` to compare the most probable classes.
+
 See [`examples/mlp`](examples/mlp) for the buildable version.
 
 ## Extension Model
@@ -82,7 +102,7 @@ External crates can implement `nut::Layer` to lower a higher-level layer into
 Nut's open graph IR. `Linear` itself lowers to explicit `Parameter`, `MatMul`,
 and `Add` nodes, so parameters participate in graph validation, optimization,
 and automatic differentiation. Runtime and gradient code generation currently
-support `Input`, `Parameter`, `MatMul`, `Add`, `Relu`, and `Sigmoid`.
+support `Input`, `Parameter`, `MatMul`, `Add`, `Relu`, `Sigmoid`, and `Softmax`.
 
 To add a higher-level layer without changing Nut itself:
 
@@ -103,14 +123,18 @@ artifact schema changes, rather than for an operator-only addition.
 
 - Generated models currently have one input and one output and use `f32`
   tensors backed by `ndarray`.
-- `#[model]` accepts `loss = "mse"` or `loss = "binary_cross_entropy"` and
-  defaults to MSE when `loss` is omitted. Binary cross entropy expects finite
-  model outputs and target values in `[0, 1]`, making it suitable for a final
-  `Sigmoid` layer.
+- `#[model]` accepts `loss = "mse"`, `loss = "binary_cross_entropy"`, or
+  `loss = "categorical_cross_entropy"` and defaults to MSE when `loss` is
+  omitted. Binary cross entropy expects finite model outputs and target values
+  in `[0, 1]`, making it suitable for a final `Sigmoid` layer. Categorical
+  cross entropy expects at least two classes and finite output and target
+  distributions that sum to one along the last dimension, making it suitable
+  for a final `Softmax` layer.
 - Training uses an in-place SGD update. The learning rate must be finite and
   non-negative.
 - Runtime `MatMul` is two-dimensional. `Add` follows `ndarray` broadcasting,
-  and its generated gradient reduces back to each input shape.
+  and its generated gradient reduces back to each input shape. `Softmax`
+  operates along the last dimension.
 - Training artifacts must contain a complete gradient plan. Every parameter
   must be reachable from the output, and every reachable operator must have a
   gradient rule.

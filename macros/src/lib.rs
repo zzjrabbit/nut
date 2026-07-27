@@ -192,7 +192,7 @@ fn validate_loss_attribute(attributes: &Punctuated<Meta, Token![,]>) -> syn::Res
         if TrainingLoss::parse(&value.value()).is_none() {
             return Err(syn::Error::new_spanned(
                 value,
-                "unsupported loss; expected \"mse\" or \"binary_cross_entropy\"",
+                "unsupported loss; expected \"mse\", \"binary_cross_entropy\", or \"categorical_cross_entropy\"",
             ));
         }
     }
@@ -458,6 +458,12 @@ fn generate_legacy_model(
                 };
                 computations.push(quote! { let #binding = #input_binding.sigmoid(); });
             }
+            "Softmax" => {
+                let [input_binding] = input_bindings.as_slice() else {
+                    return Err(operator_arity_error(span, node, 1));
+                };
+                computations.push(quote! { let #binding = #input_binding.softmax(); });
+            }
             operator => {
                 return Err(syn::Error::new_spanned(
                     span,
@@ -661,6 +667,9 @@ fn generate_trainable_model(
         TrainingLoss::BinaryCrossEntropy => {
             quote! { #output.binary_cross_entropy_loss_and_gradient(&target) }
         }
+        TrainingLoss::CategoricalCrossEntropy => {
+            quote! { #output.categorical_cross_entropy_loss_and_gradient(&target) }
+        }
     };
 
     Ok(quote! {
@@ -715,6 +724,7 @@ fn generate_trainable_model(
 enum TrainingLoss {
     Mse,
     BinaryCrossEntropy,
+    CategoricalCrossEntropy,
 }
 
 impl TrainingLoss {
@@ -722,6 +732,7 @@ impl TrainingLoss {
         match name {
             "mse" => Some(Self::Mse),
             "binary_cross_entropy" => Some(Self::BinaryCrossEntropy),
+            "categorical_cross_entropy" => Some(Self::CategoricalCrossEntropy),
             _ => None,
         }
     }
@@ -738,7 +749,7 @@ fn graph_training_loss(graph: &GraphArtifact, span: &LitStr) -> syn::Result<Trai
         syn::Error::new_spanned(
             span,
             format!(
-                "unsupported model loss {name:?}; expected \"mse\" or \"binary_cross_entropy\""
+                "unsupported model loss {name:?}; expected \"mse\", \"binary_cross_entropy\", or \"categorical_cross_entropy\""
             ),
         )
     })
@@ -750,6 +761,7 @@ enum PrimitiveOperator {
     Add,
     Relu,
     Sigmoid,
+    Softmax,
 }
 
 impl PrimitiveOperator {
@@ -759,6 +771,7 @@ impl PrimitiveOperator {
             "Add" => Some(Self::Add),
             "Relu" => Some(Self::Relu),
             "Sigmoid" => Some(Self::Sigmoid),
+            "Softmax" => Some(Self::Softmax),
             _ => None,
         }
     }
@@ -803,6 +816,12 @@ fn generate_primitive_forward(
                 return Err(operator_arity_error(span, node, 1));
             };
             Ok(quote! { let #binding = #input.sigmoid(); })
+        }
+        PrimitiveOperator::Softmax => {
+            let [input] = inputs else {
+                return Err(operator_arity_error(span, node, 1));
+            };
+            Ok(quote! { let #binding = #input.softmax(); })
         }
     }
 }
@@ -884,6 +903,18 @@ fn generate_primitive_backward(
             Ok((
                 quote! {
                     let #input_gradient = #node_value.sigmoid_backward(&#gradient);
+                },
+                vec![(node.inputs[0], input_gradient)],
+            ))
+        }
+        PrimitiveOperator::Softmax => {
+            let [_input] = inputs else {
+                return Err(operator_arity_error(span, node, 1));
+            };
+            let input_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let #input_gradient = #node_value.softmax_backward(&#gradient);
                 },
                 vec![(node.inputs[0], input_gradient)],
             ))
@@ -1061,6 +1092,24 @@ mod tests {
     }
 
     #[test]
+    fn model_macro_accepts_categorical_cross_entropy() {
+        let item = parse_quote! {
+            struct Classifier {
+                #[layer(in_dim = 10, out_dim = 3)]
+                output: Linear,
+            }
+        };
+        let generated = expand_model(
+            quote!(in_dim = 10, out_dim = 3, loss = "categorical_cross_entropy"),
+            item,
+        )
+        .unwrap()
+        .to_string();
+
+        assert!(generated.contains("categorical_cross_entropy"));
+    }
+
+    #[test]
     fn model_macro_rejects_an_unsupported_loss() {
         let item = parse_quote! {
             struct Classifier {
@@ -1155,7 +1204,7 @@ mod tests {
 
     #[test]
     fn primitive_operator_registry_contains_every_differentiable_primitive() {
-        for operator in ["MatMul", "Add", "Relu", "Sigmoid"] {
+        for operator in ["MatMul", "Add", "Relu", "Sigmoid", "Softmax"] {
             assert!(
                 PrimitiveOperator::parse(operator).is_some(),
                 "missing primitive operator {operator}"

@@ -41,6 +41,10 @@ impl TrainStepResult {
     pub fn binary_accuracy(&self, target: &Tensor<f32>) -> f32 {
         self.output.binary_accuracy(target)
     }
+
+    pub fn categorical_accuracy(&self, target: &Tensor<f32>) -> f32 {
+        self.output.categorical_accuracy(target)
+    }
 }
 
 #[cfg(feature = "ndarray")]
@@ -113,6 +117,12 @@ impl Tensor<f32> {
         }
     }
 
+    pub fn softmax(&self) -> Self {
+        Self {
+            inner: self.inner.softmax(),
+        }
+    }
+
     pub fn transpose_2d(&self) -> Self {
         Self {
             inner: self.inner.transpose_2d(),
@@ -137,6 +147,12 @@ impl Tensor<f32> {
         }
     }
 
+    pub fn softmax_backward(&self, gradient: &Self) -> Self {
+        Self {
+            inner: self.inner.softmax_backward(&gradient.inner),
+        }
+    }
+
     pub fn mse_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
         let (loss, gradient) = self.inner.mse_loss_and_gradient(&target.inner);
         (loss, Self { inner: gradient })
@@ -149,8 +165,19 @@ impl Tensor<f32> {
         (loss, Self { inner: gradient })
     }
 
+    pub fn categorical_cross_entropy_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
+        let (loss, gradient) = self
+            .inner
+            .categorical_cross_entropy_loss_and_gradient(&target.inner);
+        (loss, Self { inner: gradient })
+    }
+
     pub fn binary_accuracy(&self, target: &Self) -> f32 {
         self.inner.binary_accuracy(&target.inner)
+    }
+
+    pub fn categorical_accuracy(&self, target: &Self) -> f32 {
+        self.inner.categorical_accuracy(&target.inner)
     }
 
     pub fn scale(&self, factor: f32) -> Self {
