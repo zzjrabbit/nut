@@ -110,6 +110,7 @@ fn expand_model(arguments: TokenStream2, item: ItemStruct) -> syn::Result<TokenS
             ) -> Result<::std::path::PathBuf, ::nut::GraphError> {
                 let mut __graph = Self::graph()?;
                 __graph.optimize()?;
+                __graph.prepare_training()?;
                 __graph.write_to_out_dir(file_name)
             }
         }
@@ -238,7 +239,11 @@ struct GraphArtifact {
     name: String,
     nodes: Vec<NodeArtifact>,
     inputs: Vec<u32>,
+    #[serde(default)]
+    parameters: Vec<u32>,
     outputs: Vec<u32>,
+    #[serde(default)]
+    gradient_plan: Option<GradientPlanArtifact>,
 }
 
 #[derive(Deserialize)]
@@ -247,12 +252,21 @@ struct NodeArtifact {
     name: String,
     operator: OperatorArtifact,
     inputs: Vec<u32>,
+    #[serde(default)]
+    shape: Vec<usize>,
 }
 
 #[derive(Deserialize)]
 struct OperatorArtifact {
     name: String,
     attributes: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct GradientPlanArtifact {
+    output: u32,
+    reverse_order: Vec<u32>,
+    parameters: Vec<u32>,
 }
 
 fn expand_include_model(input: IncludeModelInput) -> syn::Result<TokenStream2> {
@@ -293,12 +307,17 @@ fn expand_include_model(input: IncludeModelInput) -> syn::Result<TokenStream2> {
 }
 
 fn generate_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStream2> {
-    if graph.version != 1 {
-        return Err(syn::Error::new_spanned(
+    match graph.version {
+        1 => generate_legacy_model(graph, span),
+        2 => generate_trainable_model(graph, span),
+        version => Err(syn::Error::new_spanned(
             span,
-            format!("unsupported graph format version {}", graph.version),
-        ));
+            format!("unsupported graph format version {version}"),
+        )),
     }
+}
+
+fn generate_legacy_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStream2> {
     if graph.inputs.len() != 1 || graph.outputs.len() != 1 {
         return Err(syn::Error::new_spanned(
             span,
@@ -417,6 +436,355 @@ fn generate_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStrea
     })
 }
 
+fn generate_trainable_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStream2> {
+    if graph.inputs.len() != 1 || graph.outputs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            span,
+            "generated models currently require exactly one input and one output",
+        ));
+    }
+    let gradient_plan = graph.gradient_plan.as_ref().ok_or_else(|| {
+        syn::Error::new_spanned(span, "version 2 model artifact has no gradient plan")
+    })?;
+    if gradient_plan.output != graph.outputs[0] {
+        return Err(syn::Error::new_spanned(
+            span,
+            "gradient plan output does not match the graph output",
+        ));
+    }
+    if gradient_plan.parameters != graph.parameters {
+        return Err(syn::Error::new_spanned(
+            span,
+            "gradient plan parameters do not match graph parameters",
+        ));
+    }
+
+    let model_ident: syn::Ident = syn::parse_str(&graph.name).map_err(|_| {
+        syn::Error::new_spanned(
+            span,
+            format!("model name {:?} is not a Rust identifier", graph.name),
+        )
+    })?;
+    let parameter_ids: std::collections::BTreeSet<_> = graph.parameters.iter().copied().collect();
+    let mut fields = Vec::new();
+    let mut initializers = Vec::new();
+    let mut computations = Vec::new();
+    let mut parameter_fields = BTreeMap::new();
+
+    for (index, node) in graph.nodes.iter().enumerate() {
+        if node.id as usize != index {
+            return Err(syn::Error::new_spanned(
+                span,
+                format!("node {} is out of topological storage order", node.id),
+            ));
+        }
+        if node.inputs.iter().any(|input| *input >= node.id) {
+            return Err(syn::Error::new_spanned(
+                span,
+                format!("node {} is not in topological order", node.id),
+            ));
+        }
+
+        let binding = node_binding(node.id);
+        let input_bindings: Vec<_> = node.inputs.iter().map(|id| node_binding(*id)).collect();
+        match node.operator.name.as_str() {
+            "Input" => {
+                if node.id != graph.inputs[0] {
+                    return Err(syn::Error::new_spanned(span, "unexpected Input node"));
+                }
+                computations.push(quote! { let #binding = input; });
+            }
+            "Parameter" => {
+                if !parameter_ids.contains(&node.id) {
+                    return Err(syn::Error::new_spanned(
+                        span,
+                        format!("parameter node {} is absent from graph parameters", node.id),
+                    ));
+                }
+                let field = rust_ident(&node.name, "parameter", span)?;
+                let dimensions = &node.shape;
+                let initializer = string_attribute(node, "init", span)?;
+                let initialize = match initializer {
+                    "zeros" => quote! { ::nut::Tensor::<f32>::new_zero(&[#(#dimensions),*]) },
+                    "normal" => {
+                        let scale = float_attribute(node, "scale", span)? as f32;
+                        quote! {
+                            ::nut::Tensor::<f32>::randn(&[#(#dimensions),*]).scale(#scale)
+                        }
+                    }
+                    initializer => {
+                        return Err(syn::Error::new_spanned(
+                            span,
+                            format!("unsupported parameter initializer {initializer:?}"),
+                        ));
+                    }
+                };
+                fields.push(quote! { pub #field: ::nut::Tensor<f32>, });
+                initializers.push(quote! { #field: #initialize, });
+                computations.push(quote! { let #binding = self.#field.clone(); });
+                parameter_fields.insert(node.id, field);
+            }
+            "MatMul" => {
+                let [left, right] = input_bindings.as_slice() else {
+                    return Err(operator_arity_error(span, node, 2));
+                };
+                computations.push(quote! { let #binding = #left.matmul(&#right); });
+            }
+            "Add" => {
+                let [left, right] = input_bindings.as_slice() else {
+                    return Err(operator_arity_error(span, node, 2));
+                };
+                computations.push(quote! { let #binding = #left.add_tensor(&#right); });
+            }
+            "Relu" => {
+                let [input] = input_bindings.as_slice() else {
+                    return Err(operator_arity_error(span, node, 1));
+                };
+                computations.push(quote! { let #binding = #input.relu(); });
+            }
+            "Sigmoid" => {
+                let [input] = input_bindings.as_slice() else {
+                    return Err(operator_arity_error(span, node, 1));
+                };
+                computations.push(quote! { let #binding = #input.sigmoid(); });
+            }
+            operator => {
+                return Err(syn::Error::new_spanned(
+                    span,
+                    format!("operator {operator:?} has no runtime code generator"),
+                ));
+            }
+        }
+    }
+
+    let output = node_binding(graph.outputs[0]);
+    let mut gradient_contributions: BTreeMap<u32, Vec<syn::Ident>> = BTreeMap::new();
+    gradient_contributions.insert(graph.outputs[0], vec![format_ident!("__output_gradient")]);
+    let mut backward = Vec::new();
+    let mut parameter_gradients = BTreeMap::new();
+    let mut gradient_index = 0usize;
+
+    for id in &gradient_plan.reverse_order {
+        let node = graph.nodes.get(*id as usize).ok_or_else(|| {
+            syn::Error::new_spanned(span, format!("gradient plan references missing node {id}"))
+        })?;
+        if node.id != *id {
+            return Err(syn::Error::new_spanned(
+                span,
+                format!("gradient plan node {id} is out of storage order"),
+            ));
+        }
+        let Some(contributions) = gradient_contributions.remove(id) else {
+            continue;
+        };
+        let gradient = combine_gradients(contributions, &mut backward, &mut gradient_index);
+        let node_value = node_binding(*id);
+        let input_values: Vec<_> = node
+            .inputs
+            .iter()
+            .map(|input| node_binding(*input))
+            .collect();
+
+        match node.operator.name.as_str() {
+            "Input" => {}
+            "Parameter" => {
+                parameter_gradients.insert(*id, gradient);
+            }
+            "Add" => {
+                let [left, right] = input_values.as_slice() else {
+                    return Err(operator_arity_error(span, node, 2));
+                };
+                let left_gradient = next_gradient_ident(&mut gradient_index);
+                let right_gradient = next_gradient_ident(&mut gradient_index);
+                backward.push(quote! {
+                    let #left_gradient = #gradient.sum_to_shape(#left.shape());
+                    let #right_gradient = #gradient.sum_to_shape(#right.shape());
+                });
+                push_gradient(&mut gradient_contributions, node.inputs[0], left_gradient);
+                push_gradient(&mut gradient_contributions, node.inputs[1], right_gradient);
+            }
+            "MatMul" => {
+                let [left, right] = input_values.as_slice() else {
+                    return Err(operator_arity_error(span, node, 2));
+                };
+                let left_gradient = next_gradient_ident(&mut gradient_index);
+                let right_gradient = next_gradient_ident(&mut gradient_index);
+                backward.push(quote! {
+                    let #left_gradient = #gradient
+                        .matmul(&#right.transpose_2d())
+                        .sum_to_shape(#left.shape());
+                    let #right_gradient = #left
+                        .transpose_2d()
+                        .matmul(&#gradient)
+                        .sum_to_shape(#right.shape());
+                });
+                push_gradient(&mut gradient_contributions, node.inputs[0], left_gradient);
+                push_gradient(&mut gradient_contributions, node.inputs[1], right_gradient);
+            }
+            "Relu" => {
+                let [input] = input_values.as_slice() else {
+                    return Err(operator_arity_error(span, node, 1));
+                };
+                let input_gradient = next_gradient_ident(&mut gradient_index);
+                backward.push(quote! {
+                    let #input_gradient = #input.relu_backward(&#gradient);
+                });
+                push_gradient(&mut gradient_contributions, node.inputs[0], input_gradient);
+            }
+            "Sigmoid" => {
+                let [_input] = input_values.as_slice() else {
+                    return Err(operator_arity_error(span, node, 1));
+                };
+                let input_gradient = next_gradient_ident(&mut gradient_index);
+                backward.push(quote! {
+                    let #input_gradient = #node_value.sigmoid_backward(&#gradient);
+                });
+                push_gradient(&mut gradient_contributions, node.inputs[0], input_gradient);
+            }
+            operator => {
+                return Err(syn::Error::new_spanned(
+                    span,
+                    format!("operator {operator:?} has no gradient code generator"),
+                ));
+            }
+        }
+    }
+
+    let mut updates = Vec::new();
+    for parameter in &graph.parameters {
+        let field = parameter_fields.get(parameter).ok_or_else(|| {
+            syn::Error::new_spanned(span, format!("missing field for parameter {parameter}"))
+        })?;
+        let gradient = parameter_gradients.get(parameter).ok_or_else(|| {
+            syn::Error::new_spanned(span, format!("parameter {parameter} has no gradient"))
+        })?;
+        updates.push(quote! {
+            self.#field.subtract_scaled(&#gradient, learning_rate);
+        });
+    }
+
+    Ok(quote! {
+        #[derive(Clone, Debug)]
+        pub struct #model_ident {
+            #(#fields)*
+        }
+
+        impl #model_ident {
+            pub fn new() -> Self {
+                Self {
+                    #(#initializers)*
+                }
+            }
+
+            pub fn forward(&self, input: ::nut::Tensor<f32>) -> ::nut::Tensor<f32> {
+                #(#computations)*
+                #output
+            }
+
+            pub fn train_step(
+                &mut self,
+                input: ::nut::Tensor<f32>,
+                target: ::nut::Tensor<f32>,
+                learning_rate: f32,
+            ) -> f32 {
+                assert!(
+                    learning_rate.is_finite() && learning_rate >= 0.0,
+                    "learning rate must be finite and non-negative",
+                );
+                #(#computations)*
+                let (__loss, __output_gradient) = #output.mse_loss_and_gradient(&target);
+                #(#backward)*
+                #(#updates)*
+                __loss
+            }
+        }
+
+        impl ::std::default::Default for #model_ident {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+    })
+}
+
+fn rust_ident(value: &str, kind: &str, span: &LitStr) -> syn::Result<syn::Ident> {
+    syn::parse_str(value).map_err(|_| {
+        syn::Error::new_spanned(
+            span,
+            format!("{kind} name {value:?} is not a Rust identifier"),
+        )
+    })
+}
+
+fn node_binding(id: u32) -> syn::Ident {
+    format_ident!("__node_{id}")
+}
+
+fn next_gradient_ident(index: &mut usize) -> syn::Ident {
+    let ident = format_ident!("__gradient_{}", *index);
+    *index += 1;
+    ident
+}
+
+fn push_gradient(gradients: &mut BTreeMap<u32, Vec<syn::Ident>>, node: u32, gradient: syn::Ident) {
+    gradients.entry(node).or_default().push(gradient);
+}
+
+fn combine_gradients(
+    gradients: Vec<syn::Ident>,
+    statements: &mut Vec<TokenStream2>,
+    index: &mut usize,
+) -> syn::Ident {
+    let mut gradients = gradients.into_iter();
+    let first = gradients.next().expect("a gradient contribution exists");
+    let remaining: Vec<_> = gradients.collect();
+    if remaining.is_empty() {
+        return first;
+    }
+    let combined = next_gradient_ident(index);
+    let mut expression = quote! { #first };
+    for gradient in remaining {
+        expression = quote! { #expression.add_tensor(&#gradient) };
+    }
+    statements.push(quote! {
+        let #combined = #expression;
+    });
+    combined
+}
+
+fn string_attribute<'a>(node: &'a NodeArtifact, name: &str, span: &LitStr) -> syn::Result<&'a str> {
+    node.operator
+        .attributes
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            syn::Error::new_spanned(
+                span,
+                format!(
+                    "operator {:?} requires string attribute {name:?}",
+                    node.operator.name
+                ),
+            )
+        })
+}
+
+fn float_attribute(node: &NodeArtifact, name: &str, span: &LitStr) -> syn::Result<f64> {
+    node.operator
+        .attributes
+        .get(name)
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| {
+            syn::Error::new_spanned(
+                span,
+                format!(
+                    "operator {:?} requires finite numeric attribute {name:?}",
+                    node.operator.name
+                ),
+            )
+        })
+}
+
 fn unsigned_attribute(node: &NodeArtifact, name: &str, span: &LitStr) -> syn::Result<usize> {
     node.operator
         .attributes
@@ -488,5 +856,63 @@ mod tests {
         };
         let error = expand_model(quote!(in_dim = 10), item).unwrap_err();
         assert!(error.to_string().contains("out_dim"));
+    }
+
+    #[test]
+    fn backward_codegen_accumulates_branch_gradients() {
+        let mut statements = Vec::new();
+        let mut index = 0;
+        let combined = combine_gradients(
+            vec![format_ident!("left"), format_ident!("right")],
+            &mut statements,
+            &mut index,
+        );
+
+        assert_eq!(combined.to_string(), "__gradient_0");
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].to_string().contains("add_tensor"));
+    }
+
+    #[test]
+    fn version_one_artifacts_keep_inference_codegen() {
+        let graph = GraphArtifact {
+            version: 1,
+            name: "Legacy".to_owned(),
+            nodes: vec![
+                NodeArtifact {
+                    id: 0,
+                    name: "input".to_owned(),
+                    operator: OperatorArtifact {
+                        name: "Input".to_owned(),
+                        attributes: BTreeMap::new(),
+                    },
+                    inputs: Vec::new(),
+                    shape: Vec::new(),
+                },
+                NodeArtifact {
+                    id: 1,
+                    name: "output".to_owned(),
+                    operator: OperatorArtifact {
+                        name: "Linear".to_owned(),
+                        attributes: BTreeMap::from([
+                            ("in_dim".to_owned(), serde_json::json!(2)),
+                            ("out_dim".to_owned(), serde_json::json!(1)),
+                        ]),
+                    },
+                    inputs: vec![0],
+                    shape: Vec::new(),
+                },
+            ],
+            inputs: vec![0],
+            parameters: Vec::new(),
+            outputs: vec![1],
+            gradient_plan: None,
+        };
+
+        let generated = generate_model(graph, &LitStr::new("legacy.json", Span::call_site()))
+            .unwrap()
+            .to_string();
+        assert!(generated.contains("fn forward"));
+        assert!(!generated.contains("train_step"));
     }
 }

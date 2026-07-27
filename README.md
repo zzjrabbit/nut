@@ -4,17 +4,19 @@ An implementation of the static-graph deep-learning framework
 [idea](https://github.com/zzjrabbit/rust-deep-learning-framework) based on Rust
 procedural macros.
 
-Nut currently provides an end-to-end inference prototype:
+Nut currently provides an end-to-end static-graph prototype for inference and
+basic training:
 
 1. A `#[model]` macro turns a readable Rust model definition into a graph
    generator.
 2. The generator runs in `build.rs`, validates and optimizes the graph, and
    writes a versioned JSON artifact to `OUT_DIR`.
 3. `include_model!` reads that artifact during compilation and generates model
-   parameters and a `forward` method.
+   parameters, `forward`, reverse-mode gradients, and an SGD training step.
 
-Training, automatic differentiation, and graph-level performance optimizations
-are not implemented yet.
+Training currently supports MSE loss and SGD for graphs built from `MatMul`,
+`Add`, `Relu`, and `Sigmoid`. More losses, optimizers, and graph-level
+performance optimizations are not implemented yet.
 
 ## Example
 
@@ -51,10 +53,14 @@ Load the optimized graph in the library or binary target:
 nut::include_model!("mlp.nut.json");
 
 fn main() {
-    let model = Mlp::new();
+    let mut model = Mlp::new();
     let input = nut::Tensor::from_vec(&[1, 10], vec![0.0; 10]).unwrap();
-    let output = model.forward(input);
+    let output = model.forward(input.clone());
     assert_eq!(output.shape(), &[1, 1]);
+
+    let target = nut::Tensor::from_vec(&[1, 1], vec![1.0]).unwrap();
+    let loss = model.train_step(input, target, 0.01);
+    assert!(loss.is_finite());
 }
 ```
 
@@ -63,5 +69,7 @@ See [`examples/mlp`](examples/mlp) for the buildable version.
 ## Extension Model
 
 External crates can implement `nut::Layer` to lower a higher-level layer into
-Nut's open graph IR. Runtime code generation currently supports the `Input`,
-`Linear`, `Relu`, and `Sigmoid` primitive operators.
+Nut's open graph IR. `Linear` itself lowers to explicit `Parameter`, `MatMul`,
+and `Add` nodes, so parameters participate in graph validation, optimization,
+and automatic differentiation. Runtime and gradient code generation currently
+support `Input`, `Parameter`, `MatMul`, `Add`, `Relu`, and `Sigmoid`.

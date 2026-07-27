@@ -16,7 +16,28 @@ pub use node::*;
 mod cursor;
 mod node;
 
-pub const GRAPH_FORMAT_VERSION: u32 = 1;
+pub const GRAPH_FORMAT_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GradientPlan {
+    output: NodeId,
+    reverse_order: Vec<NodeId>,
+    parameters: Vec<NodeId>,
+}
+
+impl GradientPlan {
+    pub fn output(&self) -> NodeId {
+        self.output
+    }
+
+    pub fn reverse_order(&self) -> &[NodeId] {
+        &self.reverse_order
+    }
+
+    pub fn parameters(&self) -> &[NodeId] {
+        &self.parameters
+    }
+}
 
 #[derive(Debug)]
 pub enum GraphError {
@@ -72,7 +93,11 @@ pub struct Graph {
     attributes: std::collections::BTreeMap<String, AttributeValue>,
     pub(crate) nodes: Vec<Node>,
     inputs: Vec<NodeId>,
+    #[serde(default)]
+    parameters: Vec<NodeId>,
     outputs: Vec<NodeId>,
+    #[serde(default)]
+    gradient_plan: Option<GradientPlan>,
 }
 
 impl Default for Graph {
@@ -93,7 +118,9 @@ impl Graph {
             attributes: Default::default(),
             nodes: Vec::new(),
             inputs: Vec::new(),
+            parameters: Vec::new(),
             outputs: Vec::new(),
+            gradient_plan: None,
         }
     }
 
@@ -113,6 +140,22 @@ impl Graph {
         let id = self.push_node(name, Operator::new("Input"), Vec::new(), shape);
         self.inputs.push(id);
         id
+    }
+
+    pub fn add_parameter(
+        &mut self,
+        name: impl Into<String>,
+        operator: Operator,
+        shape: Shape,
+    ) -> Result<NodeId, GraphError> {
+        if operator.name() != "Parameter" {
+            return Err(GraphError::invalid(
+                "parameter nodes must use the Parameter operator",
+            ));
+        }
+        let id = self.push_node(name, operator, Vec::new(), shape);
+        self.parameters.push(id);
+        Ok(id)
     }
 
     pub fn add_node(
@@ -179,8 +222,48 @@ impl Graph {
         &self.inputs
     }
 
+    pub fn parameters(&self) -> &[NodeId] {
+        &self.parameters
+    }
+
     pub fn outputs(&self) -> &[NodeId] {
         &self.outputs
+    }
+
+    pub fn gradient_plan(&self) -> Option<&GradientPlan> {
+        self.gradient_plan.as_ref()
+    }
+
+    pub fn prepare_training(&mut self) -> Result<(), GraphError> {
+        self.validate()?;
+        let [output] = self.outputs.as_slice() else {
+            return Err(GraphError::invalid(
+                "training currently requires exactly one graph output",
+            ));
+        };
+        if self.parameters.is_empty() {
+            return Err(GraphError::invalid("training graph has no parameters"));
+        }
+
+        let mut reverse_order = self.topological_order_from(&[*output])?;
+        reverse_order.reverse();
+        for id in &reverse_order {
+            let node = &self.nodes[id.index()];
+            match node.operator.name() {
+                "Input" | "Parameter" | "MatMul" | "Add" | "Relu" | "Sigmoid" => {}
+                operator => {
+                    return Err(GraphError::invalid(format!(
+                        "operator {operator:?} has no gradient rule"
+                    )));
+                }
+            }
+        }
+        self.gradient_plan = Some(GradientPlan {
+            output: *output,
+            reverse_order,
+            parameters: self.parameters.clone(),
+        });
+        Ok(())
     }
 
     pub fn cursor(&self, id: NodeId) -> Option<Cursor<'_>> {
@@ -241,12 +324,43 @@ impl Graph {
                 )));
             }
         }
+        for parameter in &self.parameters {
+            if parameter.index() >= self.nodes.len() {
+                return Err(GraphError::invalid(format!(
+                    "graph parameter {} does not exist",
+                    parameter.0
+                )));
+            }
+            if self.nodes[parameter.index()].operator.name() != "Parameter" {
+                return Err(GraphError::invalid(format!(
+                    "graph parameter {} is not a Parameter operator",
+                    parameter.0
+                )));
+            }
+        }
 
-        self.topological_order_all().map(|_| ())
+        self.topological_order_all()?;
+        for node in &self.nodes {
+            if node.operator.name() == "Input" && !self.inputs.contains(&node.id) {
+                return Err(GraphError::invalid(format!(
+                    "Input node {} is absent from graph inputs",
+                    node.id.0
+                )));
+            }
+            if node.operator.name() == "Parameter" && !self.parameters.contains(&node.id) {
+                return Err(GraphError::invalid(format!(
+                    "Parameter node {} is absent from graph parameters",
+                    node.id.0
+                )));
+            }
+            self.validate_known_operator(node)?;
+        }
+        Ok(())
     }
 
     pub fn optimize(&mut self) -> Result<(), GraphError> {
         self.validate()?;
+        self.gradient_plan = None;
         let order = self.topological_order_from(&self.outputs)?;
         let remap: HashMap<NodeId, NodeId> = order
             .iter()
@@ -270,8 +384,91 @@ impl Graph {
             .iter()
             .filter_map(|id| remap.get(id).copied())
             .collect();
+        self.parameters = self
+            .parameters
+            .iter()
+            .filter_map(|id| remap.get(id).copied())
+            .collect();
         self.outputs = self.outputs.iter().map(|id| remap[id]).collect();
         self.validate()
+    }
+
+    fn validate_known_operator(&self, node: &Node) -> Result<(), GraphError> {
+        let input_shapes: Vec<_> = node
+            .inputs
+            .iter()
+            .map(|id| self.nodes[id.index()].shape())
+            .collect();
+        let expected = match node.operator.name() {
+            "Input" | "Parameter" => {
+                if !node.inputs.is_empty() {
+                    return Err(GraphError::invalid(format!(
+                        "operator {:?} requires no inputs",
+                        node.operator.name()
+                    )));
+                }
+                return Ok(());
+            }
+            "Relu" | "Sigmoid" => {
+                let [input] = input_shapes.as_slice() else {
+                    return Err(GraphError::invalid(format!(
+                        "operator {:?} requires exactly one input",
+                        node.operator.name()
+                    )));
+                };
+                (*input).clone()
+            }
+            "Add" => {
+                let [left, right] = input_shapes.as_slice() else {
+                    return Err(GraphError::invalid(
+                        "operator \"Add\" requires exactly two inputs",
+                    ));
+                };
+                if left != right {
+                    return Err(GraphError::invalid(format!(
+                        "Add inputs have incompatible shapes {:?} and {:?}",
+                        left.dimensions(),
+                        right.dimensions()
+                    )));
+                }
+                (*left).clone()
+            }
+            "MatMul" => {
+                let [left, right] = input_shapes.as_slice() else {
+                    return Err(GraphError::invalid(
+                        "operator \"MatMul\" requires exactly two inputs",
+                    ));
+                };
+                let [right_in, right_out] = right.dimensions() else {
+                    return Err(GraphError::invalid(
+                        "MatMul right input must have exactly two dimensions",
+                    ));
+                };
+                let Some(left_in) = left.dimensions().last() else {
+                    return Err(GraphError::invalid("MatMul left input cannot be scalar"));
+                };
+                if left_in != right_in {
+                    return Err(GraphError::invalid(format!(
+                        "MatMul inner dimensions differ: {left_in} and {right_in}"
+                    )));
+                }
+                let mut dimensions = left.dimensions().to_vec();
+                *dimensions
+                    .last_mut()
+                    .expect("MatMul left shape is non-empty") = *right_out;
+                Shape::new(dimensions)
+            }
+            _ => return Ok(()),
+        };
+        if node.shape != expected {
+            return Err(GraphError::invalid(format!(
+                "operator {:?} declares shape {:?}, expected {:?}",
+                node.operator.name(),
+                node.shape.dimensions(),
+                expected.dimensions()
+            )));
+        }
+        Ok(())
     }
 
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), GraphError> {
@@ -350,6 +547,7 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Layer, LayerConfig, Linear};
 
     fn graph_with_dead_node() -> Graph {
         let mut graph = Graph::named("test");
@@ -448,5 +646,82 @@ mod tests {
         graph.nodes[0].inputs.push(NodeId(1));
         let error = graph.validate().unwrap_err();
         assert!(error.to_string().contains("cycle detected"));
+    }
+
+    #[test]
+    fn linear_lowers_to_trainable_primitive_graph() {
+        let mut graph = Graph::named("Trainable");
+        let input = graph.add_input("input", Shape::new(vec![3]));
+        let output = Linear::build(
+            &mut graph,
+            "linear",
+            &[input],
+            &LayerConfig::new()
+                .with("in_dim", 3usize)
+                .with("out_dim", 2usize),
+        )
+        .unwrap();
+        graph.set_outputs(output).unwrap();
+        graph.optimize().unwrap();
+        graph.prepare_training().unwrap();
+
+        let operators: Vec<_> = graph.nodes().map(|node| node.operator().name()).collect();
+        assert_eq!(
+            operators,
+            ["Input", "Parameter", "MatMul", "Parameter", "Add"]
+        );
+        assert_eq!(graph.parameters(), &[NodeId(1), NodeId(3)]);
+        let plan = graph.gradient_plan().unwrap();
+        assert_eq!(plan.output(), NodeId(4));
+        assert_eq!(
+            plan.reverse_order(),
+            &[NodeId(4), NodeId(3), NodeId(2), NodeId(1), NodeId(0)]
+        );
+        assert_eq!(plan.parameters(), graph.parameters());
+    }
+
+    #[test]
+    fn serialized_training_graph_uses_version_two() {
+        let mut graph = Graph::named("Trainable");
+        let input = graph.add_input("input", Shape::new(vec![1]));
+        let parameter = graph
+            .add_parameter(
+                "weight",
+                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Shape::new(vec![1]),
+            )
+            .unwrap();
+        let output = graph
+            .add_node(
+                "output",
+                Operator::new("Add"),
+                vec![input, parameter],
+                Shape::new(vec![1]),
+            )
+            .unwrap();
+        graph.set_outputs(vec![output]).unwrap();
+        graph.prepare_training().unwrap();
+
+        let artifact = serde_json::to_value(&graph).unwrap();
+        assert_eq!(artifact["version"], GRAPH_FORMAT_VERSION);
+        assert_eq!(artifact["parameters"], serde_json::json!([1]));
+        assert!(artifact["gradient_plan"].is_object());
+    }
+
+    #[test]
+    fn linear_rejects_zero_dimensions() {
+        let mut graph = Graph::named("Invalid");
+        let input = graph.add_input("input", Shape::new(vec![0]));
+        let error = Linear::build(
+            &mut graph,
+            "linear",
+            &[input],
+            &LayerConfig::new()
+                .with("in_dim", 0usize)
+                .with("out_dim", 1usize),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("greater than zero"));
     }
 }

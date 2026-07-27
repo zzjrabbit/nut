@@ -77,19 +77,42 @@ impl Layer for Linear {
             .dimensions();
         let in_dim = config.usize("in_dim")?;
         let out_dim = config.usize("out_dim")?;
+        if in_dim == 0 || out_dim == 0 {
+            return Err(GraphError::invalid(format!(
+                "Linear {name:?} dimensions must be greater than zero"
+            )));
+        }
         if input_shape.last().copied() != Some(in_dim) {
             return Err(GraphError::invalid(format!(
                 "Linear {name:?} expects input dimension {in_dim}, got {input_shape:?}"
             )));
         }
         let mut output_shape = input_shape.to_vec();
-        *output_shape.last_mut().expect("Linear shape is non-empty") = out_dim;
+        *output_shape
+            .last_mut()
+            .ok_or_else(|| GraphError::invalid("Linear input cannot be scalar"))? = out_dim;
+        let weight = graph.add_parameter(
+            format!("{name}_weight"),
+            Operator::new("Parameter")
+                .with_attribute("init", "normal")
+                .with_attribute("scale", (2.0 / in_dim as f64).sqrt()),
+            Shape::new(vec![in_dim, out_dim]),
+        )?;
+        let bias = graph.add_parameter(
+            format!("{name}_bias"),
+            Operator::new("Parameter").with_attribute("init", "zeros"),
+            Shape::new(vec![out_dim]),
+        )?;
+        let multiplied = graph.add_node(
+            format!("{name}_matmul"),
+            Operator::new("MatMul"),
+            vec![*input, weight],
+            Shape::new(output_shape.clone()),
+        )?;
         let id = graph.add_node(
             name,
-            Operator::new("Linear")
-                .with_attribute("in_dim", in_dim)
-                .with_attribute("out_dim", out_dim),
-            inputs.to_vec(),
+            Operator::new("Add"),
+            vec![multiplied, bias],
             Shape::new(output_shape),
         )?;
         Ok(vec![id])

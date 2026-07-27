@@ -51,6 +51,14 @@ impl<T: DType> Tensor<T> {
     pub fn to_vec(&self) -> Vec<T> {
         self.inner.to_vec()
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[cfg(feature = "ndarray")]
@@ -89,6 +97,45 @@ impl Tensor<f32> {
         Self {
             inner: self.inner.sigmoid(),
         }
+    }
+
+    pub fn transpose_2d(&self) -> Self {
+        Self {
+            inner: self.inner.transpose_2d(),
+        }
+    }
+
+    pub fn sum_to_shape(&self, shape: &[usize]) -> Self {
+        Self {
+            inner: self.inner.sum_to_shape(shape),
+        }
+    }
+
+    pub fn relu_backward(&self, gradient: &Self) -> Self {
+        Self {
+            inner: self.inner.relu_backward(&gradient.inner),
+        }
+    }
+
+    pub fn sigmoid_backward(&self, gradient: &Self) -> Self {
+        Self {
+            inner: self.inner.sigmoid_backward(&gradient.inner),
+        }
+    }
+
+    pub fn mse_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
+        let (loss, gradient) = self.inner.mse_loss_and_gradient(&target.inner);
+        (loss, Self { inner: gradient })
+    }
+
+    pub fn scale(&self, factor: f32) -> Self {
+        Self {
+            inner: self.inner.scale(factor),
+        }
+    }
+
+    pub fn subtract_scaled(&mut self, gradient: &Self, factor: f32) {
+        self.inner.subtract_scaled(&gradient.inner, factor);
     }
 }
 
