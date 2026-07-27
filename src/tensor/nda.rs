@@ -42,6 +42,11 @@ impl NdTensor<f32> {
             .view()
             .into_dimensionality::<Ix2>()
             .expect("right matrix must have rank 2");
+        assert_eq!(
+            lhs.shape()[1],
+            rhs.shape()[0],
+            "matmul inner dimensions must match",
+        );
         Self::from_inner(lhs.dot(&rhs).into_dyn().into_shared())
     }
 
@@ -106,7 +111,11 @@ impl NdTensor<f32> {
     }
 
     pub(crate) fn mse_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
-        assert_eq!(self.inner.shape(), target.inner.shape());
+        assert_eq!(
+            self.inner.shape(),
+            target.inner.shape(),
+            "MSE requires output and target to have the same shape",
+        );
         assert!(!self.inner.is_empty(), "MSE requires at least one value");
         let difference = &self.inner - &target.inner;
         let count = difference.len() as f32;
@@ -221,5 +230,40 @@ mod tests {
         let target = NdTensor::from_vec(&[4, 1], vec![0.0, 0.0, 1.0, 1.0]).unwrap();
 
         assert_eq!(output.binary_accuracy(&target), 0.5);
+    }
+
+    #[test]
+    fn add_broadcasts_and_its_gradient_reduces_to_the_bias_shape() {
+        let matrix = NdTensor::from_vec(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let bias = NdTensor::from_vec(&[2], vec![10.0, 20.0]).unwrap();
+
+        assert_eq!(
+            matrix.add_tensor(&bias).to_vec(),
+            vec![11.0, 22.0, 13.0, 24.0]
+        );
+
+        let output_gradient = NdTensor::from_vec(&[2, 2], vec![1.0; 4]).unwrap();
+        assert_eq!(
+            output_gradient.sum_to_shape(bias.shape()).to_vec(),
+            vec![2.0, 2.0]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "matmul inner dimensions must match")]
+    fn matmul_rejects_incompatible_inner_dimensions() {
+        let left = NdTensor::from_vec(&[1, 2], vec![1.0, 2.0]).unwrap();
+        let right = NdTensor::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
+
+        left.matmul(&right);
+    }
+
+    #[test]
+    #[should_panic(expected = "MSE requires output and target to have the same shape")]
+    fn mse_rejects_a_target_with_the_wrong_shape() {
+        let output = NdTensor::from_vec(&[2, 1], vec![0.0, 1.0]).unwrap();
+        let target = NdTensor::from_vec(&[1, 2], vec![0.0, 1.0]).unwrap();
+
+        output.mse_loss_and_gradient(&target);
     }
 }

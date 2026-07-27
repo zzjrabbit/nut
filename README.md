@@ -83,3 +83,46 @@ Nut's open graph IR. `Linear` itself lowers to explicit `Parameter`, `MatMul`,
 and `Add` nodes, so parameters participate in graph validation, optimization,
 and automatic differentiation. Runtime and gradient code generation currently
 support `Input`, `Parameter`, `MatMul`, `Add`, `Relu`, and `Sigmoid`.
+
+To add a higher-level layer without changing Nut itself:
+
+1. Implement `Layer::build` and lower the layer to the supported primitive
+   operators.
+2. Use that layer as a field in the `#[model]` declaration in `build.rs`.
+3. Keep `nut` in both `[dependencies]` and `[build-dependencies]`, write the
+   graph artifact from `build.rs`, and load the same file with
+   `#[include_model]` in the crate source.
+
+Adding a new primitive operator also requires shape validation in the graph,
+an implementation in the tensor backend, and forward and gradient generation
+in `nut-macros`. The primitive operator registry in the macro crate is the
+starting point for that work. Change `GRAPH_FORMAT_VERSION` when the serialized
+artifact schema changes, rather than for an operator-only addition.
+
+## Current Constraints
+
+- Generated models currently have one input and one output and use `f32`
+  tensors backed by `ndarray`.
+- Training uses MSE loss and an in-place SGD update. The learning rate must be
+  finite and non-negative.
+- Runtime `MatMul` is two-dimensional. `Add` follows `ndarray` broadcasting,
+  and its generated gradient reduces back to each input shape.
+- Training artifacts must contain a complete gradient plan. Every parameter
+  must be reachable from the output, and every reachable operator must have a
+  gradient rule.
+
+Graph construction, validation, and artifact I/O return `GraphError`.
+Malformed model declarations and unsupported generated operators become
+compile errors. Tensor execution treats incompatible runtime shapes, empty MSE
+inputs, and invalid learning rates as programming errors and panics with a
+descriptive message.
+
+## Development
+
+Run the complete local checks with:
+
+```console
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```

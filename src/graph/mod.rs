@@ -247,15 +247,21 @@ impl Graph {
 
         let mut reverse_order = self.topological_order_from(&[*output])?;
         reverse_order.reverse();
+        for parameter in &self.parameters {
+            if !reverse_order.contains(parameter) {
+                return Err(GraphError::invalid(format!(
+                    "parameter {} is not reachable from the training output",
+                    parameter.0
+                )));
+            }
+        }
         for id in &reverse_order {
             let node = &self.nodes[id.index()];
-            match node.operator.name() {
-                "Input" | "Parameter" | "MatMul" | "Add" | "Relu" | "Sigmoid" => {}
-                operator => {
-                    return Err(GraphError::invalid(format!(
-                        "operator {operator:?} has no gradient rule"
-                    )));
-                }
+            if !supports_gradient(node.operator.name()) {
+                return Err(GraphError::invalid(format!(
+                    "operator {:?} has no gradient rule",
+                    node.operator.name()
+                )));
             }
         }
         self.gradient_plan = Some(GradientPlan {
@@ -263,7 +269,7 @@ impl Graph {
             reverse_order,
             parameters: self.parameters.clone(),
         });
-        Ok(())
+        self.validate()
     }
 
     pub fn cursor(&self, id: NodeId) -> Option<Cursor<'_>> {
@@ -354,6 +360,52 @@ impl Graph {
                 )));
             }
             self.validate_known_operator(node)?;
+        }
+        self.validate_gradient_plan()
+    }
+
+    fn validate_gradient_plan(&self) -> Result<(), GraphError> {
+        let Some(plan) = &self.gradient_plan else {
+            return Ok(());
+        };
+        let [output] = self.outputs.as_slice() else {
+            return Err(GraphError::invalid(
+                "a gradient plan requires exactly one graph output",
+            ));
+        };
+        if plan.output != *output {
+            return Err(GraphError::invalid(
+                "gradient plan output does not match the graph output",
+            ));
+        }
+        if plan.parameters != self.parameters {
+            return Err(GraphError::invalid(
+                "gradient plan parameters do not match graph parameters",
+            ));
+        }
+
+        let mut expected_order = self.topological_order_from(&[*output])?;
+        expected_order.reverse();
+        if plan.reverse_order != expected_order {
+            return Err(GraphError::invalid(
+                "gradient plan reverse order does not match the graph",
+            ));
+        }
+        for parameter in &self.parameters {
+            if !expected_order.contains(parameter) {
+                return Err(GraphError::invalid(format!(
+                    "gradient plan parameter {} is not reachable from the graph output",
+                    parameter.0
+                )));
+            }
+        }
+        for id in &expected_order {
+            let operator = self.nodes[id.index()].operator.name();
+            if !supports_gradient(operator) {
+                return Err(GraphError::invalid(format!(
+                    "operator {operator:?} has no gradient rule"
+                )));
+            }
         }
         Ok(())
     }
@@ -544,6 +596,13 @@ impl Graph {
     }
 }
 
+fn supports_gradient(operator: &str) -> bool {
+    matches!(
+        operator,
+        "Input" | "Parameter" | "MatMul" | "Add" | "Relu" | "Sigmoid"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,5 +782,79 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn reading_rejects_tampered_gradient_plans() {
+        let mut graph = Graph::named("Trainable");
+        let input = graph.add_input("input", Shape::new(vec![1]));
+        let parameter = graph
+            .add_parameter(
+                "weight",
+                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Shape::new(vec![1]),
+            )
+            .unwrap();
+        let output = graph
+            .add_node(
+                "output",
+                Operator::new("Add"),
+                vec![input, parameter],
+                Shape::new(vec![1]),
+            )
+            .unwrap();
+        graph.set_outputs(vec![output]).unwrap();
+        graph.prepare_training().unwrap();
+
+        let artifact = serde_json::to_value(graph).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "nut-tampered-gradient-plan-{}.json",
+            std::process::id()
+        ));
+
+        for (field, value, expected) in [
+            (
+                "reverse_order",
+                serde_json::json!([2, 0, 1]),
+                "reverse order",
+            ),
+            ("output", serde_json::json!(0), "output does not match"),
+            (
+                "parameters",
+                serde_json::json!([]),
+                "parameters do not match",
+            ),
+        ] {
+            let mut tampered = artifact.clone();
+            tampered["gradient_plan"][field] = value;
+            serde_json::to_writer(std::fs::File::create(&path).unwrap(), &tampered).unwrap();
+
+            let error = Graph::read_from_path(&path).unwrap_err();
+            assert!(error.to_string().contains(expected));
+        }
+
+        let mut tampered = artifact;
+        tampered["nodes"][2]["operator"]["name"] = serde_json::json!("Unknown");
+        serde_json::to_writer(std::fs::File::create(&path).unwrap(), &tampered).unwrap();
+        let error = Graph::read_from_path(&path).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.to_string().contains("has no gradient rule"));
+    }
+
+    #[test]
+    fn training_rejects_an_unreachable_parameter() {
+        let mut graph = Graph::named("Disconnected");
+        let input = graph.add_input("input", Shape::new(vec![1]));
+        graph
+            .add_parameter(
+                "unused",
+                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Shape::new(vec![1]),
+            )
+            .unwrap();
+        graph.set_outputs(vec![input]).unwrap();
+
+        let error = graph.prepare_training().unwrap_err();
+        assert!(error.to_string().contains("not reachable"));
     }
 }

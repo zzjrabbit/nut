@@ -545,36 +545,12 @@ fn generate_trainable_model(
                 computations.push(quote! { let #binding = self.#field.clone(); });
                 parameter_fields.insert(node.id, field);
             }
-            "MatMul" => {
-                let [left, right] = input_bindings.as_slice() else {
-                    return Err(operator_arity_error(span, node, 2));
-                };
-                computations.push(quote! { let #binding = #left.matmul(&#right); });
-            }
-            "Add" => {
-                let [left, right] = input_bindings.as_slice() else {
-                    return Err(operator_arity_error(span, node, 2));
-                };
-                computations.push(quote! { let #binding = #left.add_tensor(&#right); });
-            }
-            "Relu" => {
-                let [input] = input_bindings.as_slice() else {
-                    return Err(operator_arity_error(span, node, 1));
-                };
-                computations.push(quote! { let #binding = #input.relu(); });
-            }
-            "Sigmoid" => {
-                let [input] = input_bindings.as_slice() else {
-                    return Err(operator_arity_error(span, node, 1));
-                };
-                computations.push(quote! { let #binding = #input.sigmoid(); });
-            }
-            operator => {
-                return Err(syn::Error::new_spanned(
-                    span,
-                    format!("operator {operator:?} has no runtime code generator"),
-                ));
-            }
+            _ => computations.push(generate_primitive_forward(
+                node,
+                &binding,
+                &input_bindings,
+                span,
+            )?),
         }
     }
 
@@ -611,62 +587,19 @@ fn generate_trainable_model(
             "Parameter" => {
                 parameter_gradients.insert(*id, gradient);
             }
-            "Add" => {
-                let [left, right] = input_values.as_slice() else {
-                    return Err(operator_arity_error(span, node, 2));
-                };
-                let left_gradient = next_gradient_ident(&mut gradient_index);
-                let right_gradient = next_gradient_ident(&mut gradient_index);
-                backward.push(quote! {
-                    let #left_gradient = #gradient.sum_to_shape(#left.shape());
-                    let #right_gradient = #gradient.sum_to_shape(#right.shape());
-                });
-                push_gradient(&mut gradient_contributions, node.inputs[0], left_gradient);
-                push_gradient(&mut gradient_contributions, node.inputs[1], right_gradient);
-            }
-            "MatMul" => {
-                let [left, right] = input_values.as_slice() else {
-                    return Err(operator_arity_error(span, node, 2));
-                };
-                let left_gradient = next_gradient_ident(&mut gradient_index);
-                let right_gradient = next_gradient_ident(&mut gradient_index);
-                backward.push(quote! {
-                    let #left_gradient = #gradient
-                        .matmul(&#right.transpose_2d())
-                        .sum_to_shape(#left.shape());
-                    let #right_gradient = #left
-                        .transpose_2d()
-                        .matmul(&#gradient)
-                        .sum_to_shape(#right.shape());
-                });
-                push_gradient(&mut gradient_contributions, node.inputs[0], left_gradient);
-                push_gradient(&mut gradient_contributions, node.inputs[1], right_gradient);
-            }
-            "Relu" => {
-                let [input] = input_values.as_slice() else {
-                    return Err(operator_arity_error(span, node, 1));
-                };
-                let input_gradient = next_gradient_ident(&mut gradient_index);
-                backward.push(quote! {
-                    let #input_gradient = #input.relu_backward(&#gradient);
-                });
-                push_gradient(&mut gradient_contributions, node.inputs[0], input_gradient);
-            }
-            "Sigmoid" => {
-                let [_input] = input_values.as_slice() else {
-                    return Err(operator_arity_error(span, node, 1));
-                };
-                let input_gradient = next_gradient_ident(&mut gradient_index);
-                backward.push(quote! {
-                    let #input_gradient = #node_value.sigmoid_backward(&#gradient);
-                });
-                push_gradient(&mut gradient_contributions, node.inputs[0], input_gradient);
-            }
-            operator => {
-                return Err(syn::Error::new_spanned(
+            _ => {
+                let (statement, generated_contributions) = generate_primitive_backward(
+                    node,
+                    &gradient,
+                    &node_value,
+                    &input_values,
+                    &mut gradient_index,
                     span,
-                    format!("operator {operator:?} has no gradient code generator"),
-                ));
+                )?;
+                backward.push(statement);
+                for (input, contribution) in generated_contributions {
+                    push_gradient(&mut gradient_contributions, input, contribution);
+                }
             }
         }
     }
@@ -730,6 +663,153 @@ fn generate_trainable_model(
             }
         }
     })
+}
+
+#[derive(Clone, Copy)]
+enum PrimitiveOperator {
+    MatMul,
+    Add,
+    Relu,
+    Sigmoid,
+}
+
+impl PrimitiveOperator {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "MatMul" => Some(Self::MatMul),
+            "Add" => Some(Self::Add),
+            "Relu" => Some(Self::Relu),
+            "Sigmoid" => Some(Self::Sigmoid),
+            _ => None,
+        }
+    }
+}
+
+fn generate_primitive_forward(
+    node: &NodeArtifact,
+    binding: &syn::Ident,
+    inputs: &[syn::Ident],
+    span: &LitStr,
+) -> syn::Result<TokenStream2> {
+    let operator = PrimitiveOperator::parse(&node.operator.name).ok_or_else(|| {
+        syn::Error::new_spanned(
+            span,
+            format!(
+                "operator {:?} has no runtime code generator",
+                node.operator.name
+            ),
+        )
+    })?;
+    match operator {
+        PrimitiveOperator::MatMul => {
+            let [left, right] = inputs else {
+                return Err(operator_arity_error(span, node, 2));
+            };
+            Ok(quote! { let #binding = #left.matmul(&#right); })
+        }
+        PrimitiveOperator::Add => {
+            let [left, right] = inputs else {
+                return Err(operator_arity_error(span, node, 2));
+            };
+            Ok(quote! { let #binding = #left.add_tensor(&#right); })
+        }
+        PrimitiveOperator::Relu => {
+            let [input] = inputs else {
+                return Err(operator_arity_error(span, node, 1));
+            };
+            Ok(quote! { let #binding = #input.relu(); })
+        }
+        PrimitiveOperator::Sigmoid => {
+            let [input] = inputs else {
+                return Err(operator_arity_error(span, node, 1));
+            };
+            Ok(quote! { let #binding = #input.sigmoid(); })
+        }
+    }
+}
+
+fn generate_primitive_backward(
+    node: &NodeArtifact,
+    gradient: &syn::Ident,
+    node_value: &syn::Ident,
+    inputs: &[syn::Ident],
+    gradient_index: &mut usize,
+    span: &LitStr,
+) -> syn::Result<(TokenStream2, Vec<(u32, syn::Ident)>)> {
+    let operator = PrimitiveOperator::parse(&node.operator.name).ok_or_else(|| {
+        syn::Error::new_spanned(
+            span,
+            format!(
+                "operator {:?} has no gradient code generator",
+                node.operator.name
+            ),
+        )
+    })?;
+    match operator {
+        PrimitiveOperator::Add => {
+            let [left, right] = inputs else {
+                return Err(operator_arity_error(span, node, 2));
+            };
+            let left_gradient = next_gradient_ident(gradient_index);
+            let right_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let #left_gradient = #gradient.sum_to_shape(#left.shape());
+                    let #right_gradient = #gradient.sum_to_shape(#right.shape());
+                },
+                vec![
+                    (node.inputs[0], left_gradient),
+                    (node.inputs[1], right_gradient),
+                ],
+            ))
+        }
+        PrimitiveOperator::MatMul => {
+            let [left, right] = inputs else {
+                return Err(operator_arity_error(span, node, 2));
+            };
+            let left_gradient = next_gradient_ident(gradient_index);
+            let right_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let #left_gradient = #gradient
+                        .matmul(&#right.transpose_2d())
+                        .sum_to_shape(#left.shape());
+                    let #right_gradient = #left
+                        .transpose_2d()
+                        .matmul(&#gradient)
+                        .sum_to_shape(#right.shape());
+                },
+                vec![
+                    (node.inputs[0], left_gradient),
+                    (node.inputs[1], right_gradient),
+                ],
+            ))
+        }
+        PrimitiveOperator::Relu => {
+            let [input] = inputs else {
+                return Err(operator_arity_error(span, node, 1));
+            };
+            let input_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let #input_gradient = #input.relu_backward(&#gradient);
+                },
+                vec![(node.inputs[0], input_gradient)],
+            ))
+        }
+        PrimitiveOperator::Sigmoid => {
+            let [_input] = inputs else {
+                return Err(operator_arity_error(span, node, 1));
+            };
+            let input_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let #input_gradient = #node_value.sigmoid_backward(&#gradient);
+                },
+                vec![(node.inputs[0], input_gradient)],
+            ))
+        }
+    }
 }
 
 fn rust_ident(value: &str, kind: &str, span: &LitStr) -> syn::Result<syn::Ident> {
@@ -959,5 +1039,16 @@ mod tests {
                 .to_string()
                 .contains("must not define fields")
         );
+    }
+
+    #[test]
+    fn primitive_operator_registry_contains_every_differentiable_primitive() {
+        for operator in ["MatMul", "Add", "Relu", "Sigmoid"] {
+            assert!(
+                PrimitiveOperator::parse(operator).is_some(),
+                "missing primitive operator {operator}"
+            );
+        }
+        assert!(PrimitiveOperator::parse("Unknown").is_none());
     }
 }

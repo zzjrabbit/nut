@@ -1,6 +1,9 @@
 #[nut::include_model("mlp.nut.json")]
 struct Mlp;
 
+#[nut::include_model("branch.nut.json")]
+struct BranchModel;
+
 fn main() {
     let mut model = Mlp::new();
     let input = nut::Tensor::from_vec(&[2, 10], vec![1.0; 20]).unwrap();
@@ -114,5 +117,38 @@ mod tests {
             (analytical - numerical).abs() < 2e-3,
             "gradient mismatch: analytical={analytical}, numerical={numerical}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "learning rate must be finite and non-negative")]
+    fn generated_training_rejects_an_invalid_learning_rate() {
+        let mut model = controlled_model();
+        let (input, target) = training_data();
+
+        model.train_step(input, target, f32::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "MSE requires output and target to have the same shape")]
+    fn generated_training_rejects_a_target_with_the_wrong_shape() {
+        let mut model = controlled_model();
+        let (input, _) = training_data();
+        let target = nut::Tensor::from_vec(&[1, 2], vec![1.0; 2]).unwrap();
+
+        model.train_step(input, target, 0.1);
+    }
+
+    #[test]
+    fn custom_layer_accumulates_shared_parameter_gradients() {
+        let mut model = BranchModel {
+            shared_bias: nut::Tensor::from_vec(&[1], vec![0.5]).unwrap(),
+        };
+        let input = nut::Tensor::from_vec(&[1, 1], vec![0.0]).unwrap();
+        let target = nut::Tensor::from_vec(&[1, 1], vec![0.0]).unwrap();
+
+        let result = model.train_step(input, target, 0.1);
+
+        assert_eq!(result.output.to_vec(), vec![1.0]);
+        assert!((model.shared_bias.to_vec()[0] - 0.1).abs() < 1e-6);
     }
 }
