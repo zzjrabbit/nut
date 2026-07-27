@@ -11,7 +11,7 @@ basic training:
    generator.
 2. The generator runs in `build.rs`, validates and optimizes the graph, and
    writes a versioned JSON artifact to `OUT_DIR`.
-3. `include_model!` reads that artifact during compilation and generates model
+3. `#[include_model]` reads that artifact during compilation and generates model
    parameters, `forward`, reverse-mode gradients, and an SGD training step.
 
 Training currently supports MSE loss and SGD for graphs built from `MatMul`,
@@ -47,10 +47,12 @@ fn main() {
 }
 ```
 
-Load the optimized graph in the library or binary target:
+Load the optimized graph through a struct declaration, then use it from the
+binary entry point:
 
 ```rust
-nut::include_model!("mlp.nut.json");
+#[nut::include_model("mlp.nut.json")]
+struct Mlp;
 
 fn main() {
     let mut model = Mlp::new();
@@ -59,10 +61,18 @@ fn main() {
     assert_eq!(output.shape(), &[1, 1]);
 
     let target = nut::Tensor::from_vec(&[1, 1], vec![1.0]).unwrap();
-    let loss = model.train_step(input, target, 0.01);
-    assert!(loss.is_finite());
+    let result = model.train_step(input, target.clone(), 0.01);
+    println!(
+        "loss: {:.6}, acc: {:.2}%",
+        result.loss,
+        result.binary_accuracy(&target) * 100.0,
+    );
 }
 ```
+
+`train_step` returns the output produced during that training step together with
+the loss, so calculating metrics does not require another forward pass. The
+provided `binary_accuracy` helper uses `0.5` as the class boundary.
 
 See [`examples/mlp`](examples/mlp) for the buildable version.
 

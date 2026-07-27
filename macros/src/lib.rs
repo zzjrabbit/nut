@@ -5,7 +5,7 @@ use quote::{format_ident, quote};
 use serde::Deserialize;
 use syn::{
     Attribute, Expr, ExprLit, Fields, ItemStruct, Lit, LitStr, Meta, Token, Type,
-    parse::{Parse, ParseStream, Parser},
+    parse::{ParseStream, Parser},
     parse_macro_input,
     punctuated::Punctuated,
 };
@@ -210,26 +210,16 @@ fn attributes_to_tokens(
         .collect()
 }
 
-#[proc_macro]
-pub fn include_model(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let input = parse_macro_input!(input as IncludeModelInput);
-    match expand_include_model(input) {
-        Ok(tokens) => tokens.into(),
+#[proc_macro_attribute]
+pub fn include_model(
+    arguments: proc_macro::TokenStream,
+    input: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let file_name = parse_macro_input!(arguments as LitStr);
+    let structure = parse_macro_input!(input as ItemStruct);
+    match expand_include_model(file_name, structure) {
+        Ok(model) => model.into(),
         Err(error) => error.into_compile_error().into(),
-    }
-}
-
-struct IncludeModelInput {
-    file_name: LitStr,
-}
-
-impl Parse for IncludeModelInput {
-    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let file_name = input.parse()?;
-        if !input.is_empty() {
-            return Err(input.error("include_model! expects one artifact file name"));
-        }
-        Ok(Self { file_name })
     }
 }
 
@@ -269,47 +259,75 @@ struct GradientPlanArtifact {
     parameters: Vec<u32>,
 }
 
-fn expand_include_model(input: IncludeModelInput) -> syn::Result<TokenStream2> {
-    let file_name = input.file_name.value();
-    if PathBuf::from(&file_name)
+fn expand_include_model(file_name: LitStr, structure: ItemStruct) -> syn::Result<TokenStream2> {
+    validate_include_target(&structure)?;
+    let artifact_name = file_name.value();
+    if PathBuf::from(&artifact_name)
         .file_name()
         .and_then(|name| name.to_str())
-        != Some(&file_name)
+        != Some(&artifact_name)
     {
         return Err(syn::Error::new_spanned(
-            &input.file_name,
+            &file_name,
             "model artifact must be a file name inside OUT_DIR",
         ));
     }
     let out_dir = std::env::var_os("OUT_DIR").ok_or_else(|| {
-        syn::Error::new_spanned(
-            &input.file_name,
-            "OUT_DIR is unavailable during macro expansion",
-        )
+        syn::Error::new_spanned(&file_name, "OUT_DIR is unavailable during macro expansion")
     })?;
-    let path = PathBuf::from(out_dir).join(&file_name);
+    let path = PathBuf::from(out_dir).join(&artifact_name);
     let source = fs::read_to_string(&path).map_err(|error| {
         syn::Error::new_spanned(
-            &input.file_name,
+            &file_name,
             format!("failed to read model artifact {}: {error}", path.display()),
         )
     })?;
     let graph: GraphArtifact = serde_json::from_str(&source).map_err(|error| {
         syn::Error::new_spanned(
-            &input.file_name,
+            &file_name,
             format!(
                 "failed to decode model artifact {}: {error}",
                 path.display()
             ),
         )
     })?;
-    generate_model(graph, &input.file_name)
+    generate_model(graph, &file_name, &structure)
 }
 
-fn generate_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStream2> {
+fn validate_include_target(structure: &ItemStruct) -> syn::Result<()> {
+    if !structure.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &structure.generics,
+            "included model declarations cannot be generic",
+        ));
+    }
+    if !structure.fields.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &structure.fields,
+            "included model declarations must not define fields",
+        ));
+    }
+    Ok(())
+}
+
+fn generate_model(
+    graph: GraphArtifact,
+    span: &LitStr,
+    structure: &ItemStruct,
+) -> syn::Result<TokenStream2> {
+    if structure.ident != graph.name.as_str() {
+        return Err(syn::Error::new_spanned(
+            &structure.ident,
+            format!(
+                "model declaration {:?} does not match artifact model {:?}",
+                structure.ident.to_string(),
+                graph.name,
+            ),
+        ));
+    }
     match graph.version {
-        1 => generate_legacy_model(graph, span),
-        2 => generate_trainable_model(graph, span),
+        1 => generate_legacy_model(graph, span, structure),
+        2 => generate_trainable_model(graph, span, structure),
         version => Err(syn::Error::new_spanned(
             span,
             format!("unsupported graph format version {version}"),
@@ -317,19 +335,20 @@ fn generate_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStrea
     }
 }
 
-fn generate_legacy_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStream2> {
+fn generate_legacy_model(
+    graph: GraphArtifact,
+    span: &LitStr,
+    structure: &ItemStruct,
+) -> syn::Result<TokenStream2> {
     if graph.inputs.len() != 1 || graph.outputs.len() != 1 {
         return Err(syn::Error::new_spanned(
             span,
             "generated models currently require exactly one input and one output",
         ));
     }
-    let model_ident: syn::Ident = syn::parse_str(&graph.name).map_err(|_| {
-        syn::Error::new_spanned(
-            span,
-            format!("model name {:?} is not a Rust identifier", graph.name),
-        )
-    })?;
+    let model_ident = &structure.ident;
+    let visibility = &structure.vis;
+    let attributes = &structure.attrs;
 
     let mut fields = Vec::new();
     let mut initializers = Vec::new();
@@ -411,7 +430,8 @@ fn generate_legacy_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<Tok
     let output = format_ident!("__node_{}", graph.outputs[0]);
 
     Ok(quote! {
-        pub struct #model_ident {
+        #(#attributes)*
+        #visibility struct #model_ident {
             #(#fields)*
         }
 
@@ -436,7 +456,11 @@ fn generate_legacy_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<Tok
     })
 }
 
-fn generate_trainable_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<TokenStream2> {
+fn generate_trainable_model(
+    graph: GraphArtifact,
+    span: &LitStr,
+    structure: &ItemStruct,
+) -> syn::Result<TokenStream2> {
     if graph.inputs.len() != 1 || graph.outputs.len() != 1 {
         return Err(syn::Error::new_spanned(
             span,
@@ -459,12 +483,9 @@ fn generate_trainable_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<
         ));
     }
 
-    let model_ident: syn::Ident = syn::parse_str(&graph.name).map_err(|_| {
-        syn::Error::new_spanned(
-            span,
-            format!("model name {:?} is not a Rust identifier", graph.name),
-        )
-    })?;
+    let model_ident = &structure.ident;
+    let visibility = &structure.vis;
+    let attributes = &structure.attrs;
     let parameter_ids: std::collections::BTreeSet<_> = graph.parameters.iter().copied().collect();
     let mut fields = Vec::new();
     let mut initializers = Vec::new();
@@ -664,8 +685,9 @@ fn generate_trainable_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<
     }
 
     Ok(quote! {
+        #(#attributes)*
         #[derive(Clone, Debug)]
-        pub struct #model_ident {
+        #visibility struct #model_ident {
             #(#fields)*
         }
 
@@ -686,7 +708,7 @@ fn generate_trainable_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<
                 input: ::nut::Tensor<f32>,
                 target: ::nut::Tensor<f32>,
                 learning_rate: f32,
-            ) -> f32 {
+            ) -> ::nut::TrainStepResult {
                 assert!(
                     learning_rate.is_finite() && learning_rate >= 0.0,
                     "learning rate must be finite and non-negative",
@@ -695,7 +717,10 @@ fn generate_trainable_model(graph: GraphArtifact, span: &LitStr) -> syn::Result<
                 let (__loss, __output_gradient) = #output.mse_loss_and_gradient(&target);
                 #(#backward)*
                 #(#updates)*
-                __loss
+                ::nut::TrainStepResult {
+                    loss: __loss,
+                    output: #output,
+                }
             }
         }
 
@@ -909,10 +934,30 @@ mod tests {
             gradient_plan: None,
         };
 
-        let generated = generate_model(graph, &LitStr::new("legacy.json", Span::call_site()))
-            .unwrap()
-            .to_string();
+        let structure = parse_quote!(
+            struct Legacy;
+        );
+        let generated = generate_model(
+            graph,
+            &LitStr::new("legacy.json", Span::call_site()),
+            &structure,
+        )
+        .unwrap()
+        .to_string();
         assert!(generated.contains("fn forward"));
         assert!(!generated.contains("train_step"));
+    }
+
+    #[test]
+    fn included_model_requires_an_empty_matching_struct() {
+        let with_fields: ItemStruct = parse_quote! {
+            struct Mlp { field: usize }
+        };
+        assert!(
+            validate_include_target(&with_fields)
+                .unwrap_err()
+                .to_string()
+                .contains("must not define fields")
+        );
     }
 }

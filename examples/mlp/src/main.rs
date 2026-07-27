@@ -1,4 +1,20 @@
-nut::include_model!("mlp.nut.json");
+#[nut::include_model("mlp.nut.json")]
+struct Mlp;
+
+fn main() {
+    let mut model = Mlp::new();
+    let input = nut::Tensor::from_vec(&[2, 10], vec![1.0; 20]).unwrap();
+    let target = nut::Tensor::from_vec(&[2, 1], vec![1.0; 2]).unwrap();
+
+    for step in 1..=200 {
+        let result = model.train_step(input.clone(), target.clone(), 0.1);
+        println!(
+            "step {step:03}  loss: {:.6}  acc: {:.2}%",
+            result.loss,
+            result.binary_accuracy(&target) * 100.0,
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -56,6 +72,19 @@ mod tests {
             final_loss < initial_loss * 0.1,
             "loss did not converge: {initial_loss} -> {final_loss}"
         );
+    }
+
+    #[test]
+    fn training_result_contains_loss_output_and_accuracy() {
+        let mut model = controlled_model();
+        let (input, target) = training_data();
+        let expected_output = model.forward(input.clone());
+
+        let result = model.train_step(input, target.clone(), 0.1);
+
+        assert!(result.loss.is_finite());
+        assert_eq!(result.output.to_vec(), expected_output.to_vec());
+        assert_eq!(result.binary_accuracy(&target), 1.0);
     }
 
     #[test]

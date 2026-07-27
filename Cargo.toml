@@ -9,6 +9,7 @@ edition = "2024"
 
 [workspace]
 members = ["examples/mlp", "macros"]
+default-members = ["examples/mlp"]
 
 [workspace.dependencies]
 nut-macros = { version = "0.1.0", path = "macros" }

@@ -30,6 +30,20 @@ pub struct Tensor<T: DType> {
 }
 
 #[cfg(feature = "ndarray")]
+#[derive(Clone, Debug)]
+pub struct TrainStepResult {
+    pub loss: f32,
+    pub output: Tensor<f32>,
+}
+
+#[cfg(feature = "ndarray")]
+impl TrainStepResult {
+    pub fn binary_accuracy(&self, target: &Tensor<f32>) -> f32 {
+        self.output.binary_accuracy(target)
+    }
+}
+
+#[cfg(feature = "ndarray")]
 impl<T: DType> Tensor<T> {
     pub fn new_zero(shape: &[usize]) -> Self {
         Self {
@@ -126,6 +140,10 @@ impl Tensor<f32> {
     pub fn mse_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
         let (loss, gradient) = self.inner.mse_loss_and_gradient(&target.inner);
         (loss, Self { inner: gradient })
+    }
+
+    pub fn binary_accuracy(&self, target: &Self) -> f32 {
+        self.inner.binary_accuracy(&target.inner)
     }
 
     pub fn scale(&self, factor: f32) -> Self {

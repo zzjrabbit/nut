@@ -115,6 +115,25 @@ impl NdTensor<f32> {
         (loss, Self::from_inner(gradient))
     }
 
+    pub(crate) fn binary_accuracy(&self, target: &Self) -> f32 {
+        assert_eq!(
+            self.inner.shape(),
+            target.inner.shape(),
+            "binary accuracy requires output and target to have the same shape",
+        );
+        assert!(
+            !self.inner.is_empty(),
+            "binary accuracy requires at least one value",
+        );
+        let correct = self
+            .inner
+            .iter()
+            .zip(target.inner.iter())
+            .filter(|(output, target)| (**output >= 0.5) == (**target >= 0.5))
+            .count();
+        correct as f32 / self.inner.len() as f32
+    }
+
     pub(crate) fn scale(&self, factor: f32) -> Self {
         Self::from_inner(self.inner.mapv(|value| value * factor).into_shared())
     }
@@ -194,5 +213,13 @@ mod tests {
         let bias = NdTensor::from_vec(&[2], vec![1.0, 1.0]).unwrap();
         let output = input.matmul(&weights).add_tensor(&bias).relu();
         assert_eq!(output.to_vec(), vec![3.0, 0.0]);
+    }
+
+    #[test]
+    fn binary_accuracy_uses_half_as_the_class_boundary() {
+        let output = NdTensor::from_vec(&[4, 1], vec![0.2, 0.5, 0.8, 0.1]).unwrap();
+        let target = NdTensor::from_vec(&[4, 1], vec![0.0, 0.0, 1.0, 1.0]).unwrap();
+
+        assert_eq!(output.binary_accuracy(&target), 0.5);
     }
 }
