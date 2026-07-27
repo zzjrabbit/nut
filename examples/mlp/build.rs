@@ -35,7 +35,7 @@ impl nut::Layer for SharedBias {
     }
 }
 
-#[model(in_dim = 10, out_dim = 1)]
+#[model(in_dim = 10, out_dim = 1, loss = "binary_cross_entropy")]
 struct Mlp {
     #[layer(in_dim = 10, out_dim = 20)]
     layer1: Linear,

@@ -142,6 +142,13 @@ impl Tensor<f32> {
         (loss, Self { inner: gradient })
     }
 
+    pub fn binary_cross_entropy_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
+        let (loss, gradient) = self
+            .inner
+            .binary_cross_entropy_loss_and_gradient(&target.inner);
+        (loss, Self { inner: gradient })
+    }
+
     pub fn binary_accuracy(&self, target: &Self) -> f32 {
         self.inner.binary_accuracy(&target.inner)
     }

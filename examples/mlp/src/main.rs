@@ -42,7 +42,10 @@ mod tests {
     }
 
     fn loss(model: &Mlp, input: &nut::Tensor<f32>, target: &nut::Tensor<f32>) -> f32 {
-        model.forward(input.clone()).mse_loss_and_gradient(target).0
+        model
+            .forward(input.clone())
+            .binary_cross_entropy_loss_and_gradient(target)
+            .0
     }
 
     #[test]
@@ -86,6 +89,10 @@ mod tests {
         let result = model.train_step(input, target.clone(), 0.1);
 
         assert!(result.loss.is_finite());
+        let expected_loss = expected_output
+            .binary_cross_entropy_loss_and_gradient(&target)
+            .0;
+        assert!((result.loss - expected_loss).abs() < 1e-6);
         assert_eq!(result.output.to_vec(), expected_output.to_vec());
         assert_eq!(result.binary_accuracy(&target), 1.0);
     }
@@ -129,7 +136,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "MSE requires output and target to have the same shape")]
+    #[should_panic(
+        expected = "binary cross entropy requires output and target to have the same shape"
+    )]
     fn generated_training_rejects_a_target_with_the_wrong_shape() {
         let mut model = controlled_model();
         let (input, _) = training_data();

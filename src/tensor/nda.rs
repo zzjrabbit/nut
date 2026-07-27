@@ -124,6 +124,50 @@ impl NdTensor<f32> {
         (loss, Self::from_inner(gradient))
     }
 
+    pub(crate) fn binary_cross_entropy_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
+        assert_eq!(
+            self.inner.shape(),
+            target.inner.shape(),
+            "binary cross entropy requires output and target to have the same shape",
+        );
+        assert!(
+            !self.inner.is_empty(),
+            "binary cross entropy requires at least one value",
+        );
+        assert!(
+            self.inner
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+            "binary cross entropy requires finite output values in [0, 1]",
+        );
+        assert!(
+            target
+                .inner
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+            "binary cross entropy requires finite target values in [0, 1]",
+        );
+
+        let count = self.inner.len() as f32;
+        let epsilon = f32::EPSILON;
+        let probabilities = self.inner.mapv(|value| value.clamp(epsilon, 1.0 - epsilon));
+        let loss = probabilities
+            .iter()
+            .zip(target.inner.iter())
+            .map(|(output, target)| -(target * output.ln() + (1.0 - target) * (1.0 - output).ln()))
+            .sum::<f32>()
+            / count;
+        let gradient = probabilities
+            .iter()
+            .zip(target.inner.iter())
+            .map(|(output, target)| (output - target) / (output * (1.0 - output) * count))
+            .collect::<ndarray::Array1<_>>()
+            .into_shape_with_order(self.inner.raw_dim())
+            .expect("binary cross entropy gradient shape is unchanged")
+            .into_shared();
+        (loss, Self::from_inner(gradient))
+    }
+
     pub(crate) fn binary_accuracy(&self, target: &Self) -> f32 {
         assert_eq!(
             self.inner.shape(),
@@ -233,6 +277,39 @@ mod tests {
     }
 
     #[test]
+    fn binary_cross_entropy_has_expected_loss_and_gradient() {
+        let output = NdTensor::from_vec(&[2], vec![0.25, 0.75]).unwrap();
+        let target = NdTensor::from_vec(&[2], vec![0.0, 1.0]).unwrap();
+
+        let (loss, gradient) = output.binary_cross_entropy_loss_and_gradient(&target);
+
+        assert!((loss - -0.75_f32.ln()).abs() < 1e-6);
+        let gradient = gradient.to_vec();
+        assert!((gradient[0] - 2.0 / 3.0).abs() < 1e-6);
+        assert!((gradient[1] + 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn binary_cross_entropy_is_finite_at_probability_boundaries() {
+        let output = NdTensor::from_vec(&[2], vec![0.0, 1.0]).unwrap();
+        let target = NdTensor::from_vec(&[2], vec![1.0, 0.0]).unwrap();
+
+        let (loss, gradient) = output.binary_cross_entropy_loss_and_gradient(&target);
+
+        assert!(loss.is_finite());
+        assert!(gradient.to_vec().into_iter().all(f32::is_finite));
+    }
+
+    #[test]
+    #[should_panic(expected = "binary cross entropy requires finite target values in [0, 1]")]
+    fn binary_cross_entropy_rejects_invalid_targets() {
+        let output = NdTensor::from_vec(&[1], vec![0.5]).unwrap();
+        let target = NdTensor::from_vec(&[1], vec![1.5]).unwrap();
+
+        output.binary_cross_entropy_loss_and_gradient(&target);
+    }
+
+    #[test]
     fn add_broadcasts_and_its_gradient_reduces_to_the_bias_shape() {
         let matrix = NdTensor::from_vec(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let bias = NdTensor::from_vec(&[2], vec![10.0, 20.0]).unwrap();
@@ -265,5 +342,16 @@ mod tests {
         let target = NdTensor::from_vec(&[1, 2], vec![0.0, 1.0]).unwrap();
 
         output.mse_loss_and_gradient(&target);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "binary cross entropy requires output and target to have the same shape"
+    )]
+    fn binary_cross_entropy_rejects_a_target_with_the_wrong_shape() {
+        let output = NdTensor::from_vec(&[2, 1], vec![0.25, 0.75]).unwrap();
+        let target = NdTensor::from_vec(&[1, 2], vec![0.0, 1.0]).unwrap();
+
+        output.binary_cross_entropy_loss_and_gradient(&target);
     }
 }

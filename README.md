@@ -14,9 +14,9 @@ basic training:
 3. `#[include_model]` reads that artifact during compilation and generates model
    parameters, `forward`, reverse-mode gradients, and an SGD training step.
 
-Training currently supports MSE loss and SGD for graphs built from `MatMul`,
-`Add`, `Relu`, and `Sigmoid`. More losses, optimizers, and graph-level
-performance optimizations are not implemented yet.
+Training currently supports MSE or binary cross-entropy loss and SGD for graphs
+built from `MatMul`, `Add`, `Relu`, and `Sigmoid`. More losses, optimizers, and
+graph-level performance optimizations are not implemented yet.
 
 ## Example
 
@@ -26,7 +26,7 @@ in `build.rs`:
 ```rust
 use nut::{Linear, model, relu, sigmoid};
 
-#[model(in_dim = 10, out_dim = 1)]
+#[model(in_dim = 10, out_dim = 1, loss = "binary_cross_entropy")]
 struct Mlp {
     #[layer(in_dim = 10, out_dim = 20)]
     layer1: Linear,
@@ -103,8 +103,12 @@ artifact schema changes, rather than for an operator-only addition.
 
 - Generated models currently have one input and one output and use `f32`
   tensors backed by `ndarray`.
-- Training uses MSE loss and an in-place SGD update. The learning rate must be
-  finite and non-negative.
+- `#[model]` accepts `loss = "mse"` or `loss = "binary_cross_entropy"` and
+  defaults to MSE when `loss` is omitted. Binary cross entropy expects finite
+  model outputs and target values in `[0, 1]`, making it suitable for a final
+  `Sigmoid` layer.
+- Training uses an in-place SGD update. The learning rate must be finite and
+  non-negative.
 - Runtime `MatMul` is two-dimensional. `Add` follows `ndarray` broadcasting,
   and its generated gradient reduces back to each input shape.
 - Training artifacts must contain a complete gradient plan. Every parameter

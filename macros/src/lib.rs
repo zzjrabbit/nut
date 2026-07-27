@@ -39,6 +39,7 @@ fn expand_model(arguments: TokenStream2, item: ItemStruct) -> syn::Result<TokenS
     let model_attributes = parse_meta_list.parse2(arguments)?;
     let in_dim = required_usize(&model_attributes, "in_dim")?;
     let out_dim = required_usize(&model_attributes, "out_dim")?;
+    validate_loss_attribute(&model_attributes)?;
     let model_attribute_tokens = attributes_to_tokens(&model_attributes)?;
 
     let mut layer_steps = Vec::new();
@@ -162,6 +163,42 @@ fn required_usize(attributes: &Punctuated<Meta, Token![,]>, name: &str) -> syn::
     ))
 }
 
+fn validate_loss_attribute(attributes: &Punctuated<Meta, Token![,]>) -> syn::Result<()> {
+    let mut found = false;
+    for attribute in attributes {
+        if !attribute.path().is_ident("loss") {
+            continue;
+        }
+        if found {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "duplicate model attribute \"loss\"",
+            ));
+        }
+        found = true;
+        let Meta::NameValue(value) = attribute else {
+            return Err(syn::Error::new_spanned(attribute, "loss must be a string"));
+        };
+        let Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) = &value.value
+        else {
+            return Err(syn::Error::new_spanned(
+                &value.value,
+                "loss must be a string",
+            ));
+        };
+        if TrainingLoss::parse(&value.value()).is_none() {
+            return Err(syn::Error::new_spanned(
+                value,
+                "unsupported loss; expected \"mse\" or \"binary_cross_entropy\"",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn attributes_to_tokens(
     attributes: &Punctuated<Meta, Token![,]>,
 ) -> syn::Result<Vec<TokenStream2>> {
@@ -227,6 +264,8 @@ pub fn include_model(
 struct GraphArtifact {
     version: u32,
     name: String,
+    #[serde(default)]
+    attributes: BTreeMap<String, serde_json::Value>,
     nodes: Vec<NodeArtifact>,
     inputs: Vec<u32>,
     #[serde(default)]
@@ -482,6 +521,7 @@ fn generate_trainable_model(
             "gradient plan parameters do not match graph parameters",
         ));
     }
+    let loss = graph_training_loss(&graph, span)?;
 
     let model_ident = &structure.ident;
     let visibility = &structure.vis;
@@ -616,6 +656,12 @@ fn generate_trainable_model(
             self.#field.subtract_scaled(&#gradient, learning_rate);
         });
     }
+    let loss_and_gradient = match loss {
+        TrainingLoss::Mse => quote! { #output.mse_loss_and_gradient(&target) },
+        TrainingLoss::BinaryCrossEntropy => {
+            quote! { #output.binary_cross_entropy_loss_and_gradient(&target) }
+        }
+    };
 
     Ok(quote! {
         #(#attributes)*
@@ -647,7 +693,7 @@ fn generate_trainable_model(
                     "learning rate must be finite and non-negative",
                 );
                 #(#computations)*
-                let (__loss, __output_gradient) = #output.mse_loss_and_gradient(&target);
+                let (__loss, __output_gradient) = #loss_and_gradient;
                 #(#backward)*
                 #(#updates)*
                 ::nut::TrainStepResult {
@@ -662,6 +708,39 @@ fn generate_trainable_model(
                 Self::new()
             }
         }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum TrainingLoss {
+    Mse,
+    BinaryCrossEntropy,
+}
+
+impl TrainingLoss {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "mse" => Some(Self::Mse),
+            "binary_cross_entropy" => Some(Self::BinaryCrossEntropy),
+            _ => None,
+        }
+    }
+}
+
+fn graph_training_loss(graph: &GraphArtifact, span: &LitStr) -> syn::Result<TrainingLoss> {
+    let Some(value) = graph.attributes.get("loss") else {
+        return Ok(TrainingLoss::Mse);
+    };
+    let name = value
+        .as_str()
+        .ok_or_else(|| syn::Error::new_spanned(span, "model loss must be a string"))?;
+    TrainingLoss::parse(name).ok_or_else(|| {
+        syn::Error::new_spanned(
+            span,
+            format!(
+                "unsupported model loss {name:?}; expected \"mse\" or \"binary_cross_entropy\""
+            ),
+        )
     })
 }
 
@@ -964,6 +1043,38 @@ mod tests {
     }
 
     #[test]
+    fn model_macro_accepts_binary_cross_entropy() {
+        let item = parse_quote! {
+            struct Classifier {
+                #[layer(in_dim = 10, out_dim = 1)]
+                output: Linear,
+            }
+        };
+        let generated = expand_model(
+            quote!(in_dim = 10, out_dim = 1, loss = "binary_cross_entropy"),
+            item,
+        )
+        .unwrap()
+        .to_string();
+
+        assert!(generated.contains("binary_cross_entropy"));
+    }
+
+    #[test]
+    fn model_macro_rejects_an_unsupported_loss() {
+        let item = parse_quote! {
+            struct Classifier {
+                #[layer(in_dim = 10, out_dim = 1)]
+                output: Linear,
+            }
+        };
+        let error =
+            expand_model(quote!(in_dim = 10, out_dim = 1, loss = "unknown"), item).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported loss"));
+    }
+
+    #[test]
     fn backward_codegen_accumulates_branch_gradients() {
         let mut statements = Vec::new();
         let mut index = 0;
@@ -983,6 +1094,7 @@ mod tests {
         let graph = GraphArtifact {
             version: 1,
             name: "Legacy".to_owned(),
+            attributes: BTreeMap::new(),
             nodes: vec![
                 NodeArtifact {
                     id: 0,
