@@ -20,7 +20,7 @@ use ureq::{
 const IMAGE_SIZE: usize = 28 * 28;
 const CLASS_COUNT: usize = 10;
 const DEFAULT_BATCH_SIZE: usize = 64;
-const DEFAULT_EPOCHS: usize = 5;
+const DEFAULT_EPOCHS: usize = 50;
 const LEARNING_RATE: f32 = 1e-3;
 const DOWNLOAD_BASE_URL: &str = "https://storage.googleapis.com/cvdf-datasets/mnist";
 const DOWNLOAD_REPORT_INTERVAL: u64 = 512 * 1024;

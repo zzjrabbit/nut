@@ -111,9 +111,10 @@ Targets have the same shape as the output and contain a probability
 distribution for each sample, such as one-hot labels. Use
 `TrainStepResult::categorical_accuracy` to compare the most probable classes.
 
-See [`examples/mlp`](examples/mlp) for the compact buildable version, or
-[`examples/mnist`](examples/mnist) for a complete handwritten-digit training
-example using the original MNIST dataset.
+See [`examples/mlp`](examples/mlp) for the compact buildable version,
+[`examples/mnist`](examples/mnist) for handwritten-digit classification, or
+[`examples/cifar10`](examples/cifar10) for color-image classification using
+the official CIFAR-10 binary dataset.
 
 ## Extension Model
 

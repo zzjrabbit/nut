@@ -1,0 +1,14 @@
+[package]
+name = "nut-cifar10-example"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+flate2 = "1.1.9"
+nut = { path = "../.." }
+tar = { version = "0.4.44", default-features = false }
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
+
+[build-dependencies]
+nut = { path = "../.." }
