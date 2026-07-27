@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use crate::{AttributeValue, Graph, GraphError, NodeId, Operator, Shape};
+use crate::{AttributeValue, Graph, GraphError, NodeId, Primitive, Shape};
 
 #[derive(Clone, Debug, Default)]
-pub struct LayerConfig {
+pub struct OperatorConfig {
     attributes: BTreeMap<String, AttributeValue>,
 }
 
-impl LayerConfig {
+impl OperatorConfig {
     pub fn new() -> Self {
         Self::default()
     }
@@ -48,24 +48,28 @@ impl LayerConfig {
     }
 }
 
-/// Lowers a user-facing layer into one or more primitive graph operators.
-pub trait Layer {
-    fn build(
+/// Expands a user-facing operator into one or more graph primitives.
+///
+/// Implementations are lightweight shells used by the model DSL in
+/// `build.rs`. Only the primitives produced here are written to graph
+/// artifacts and consumed by runtime code generation.
+pub trait Operator {
+    fn expand(
         graph: &mut Graph,
         name: &str,
         inputs: &[NodeId],
-        config: &LayerConfig,
+        config: &OperatorConfig,
     ) -> Result<Vec<NodeId>, GraphError>;
 }
 
 pub struct Linear;
 
-impl Layer for Linear {
-    fn build(
+impl Operator for Linear {
+    fn expand(
         graph: &mut Graph,
         name: &str,
         inputs: &[NodeId],
-        config: &LayerConfig,
+        config: &OperatorConfig,
     ) -> Result<Vec<NodeId>, GraphError> {
         let [input] = inputs else {
             return Err(GraphError::invalid("Linear requires exactly one input"));
@@ -93,25 +97,25 @@ impl Layer for Linear {
             .ok_or_else(|| GraphError::invalid("Linear input cannot be scalar"))? = out_dim;
         let weight = graph.add_parameter(
             format!("{name}_weight"),
-            Operator::new("Parameter")
+            Primitive::parameter()
                 .with_attribute("init", "normal")
                 .with_attribute("scale", (2.0 / in_dim as f64).sqrt()),
             Shape::new(vec![in_dim, out_dim]),
         )?;
         let bias = graph.add_parameter(
             format!("{name}_bias"),
-            Operator::new("Parameter").with_attribute("init", "zeros"),
+            Primitive::parameter().with_attribute("init", "zeros"),
             Shape::new(vec![out_dim]),
         )?;
         let multiplied = graph.add_node(
             format!("{name}_matmul"),
-            Operator::new("MatMul"),
+            Primitive::mat_mul(),
             vec![*input, weight],
             Shape::new(output_shape.clone()),
         )?;
         let id = graph.add_node(
             name,
-            Operator::new("Add"),
+            Primitive::add(),
             vec![multiplied, bias],
             Shape::new(output_shape),
         )?;
@@ -121,12 +125,12 @@ impl Layer for Linear {
 
 pub struct Relu;
 
-impl Layer for Relu {
-    fn build(
+impl Operator for Relu {
+    fn expand(
         graph: &mut Graph,
         name: &str,
         inputs: &[NodeId],
-        config: &LayerConfig,
+        config: &OperatorConfig,
     ) -> Result<Vec<NodeId>, GraphError> {
         unary(graph, name, inputs, config, "Relu")
     }
@@ -134,12 +138,12 @@ impl Layer for Relu {
 
 pub struct Sigmoid;
 
-impl Layer for Sigmoid {
-    fn build(
+impl Operator for Sigmoid {
+    fn expand(
         graph: &mut Graph,
         name: &str,
         inputs: &[NodeId],
-        config: &LayerConfig,
+        config: &OperatorConfig,
     ) -> Result<Vec<NodeId>, GraphError> {
         unary(graph, name, inputs, config, "Sigmoid")
     }
@@ -147,12 +151,12 @@ impl Layer for Sigmoid {
 
 pub struct Softmax;
 
-impl Layer for Softmax {
-    fn build(
+impl Operator for Softmax {
+    fn expand(
         graph: &mut Graph,
         name: &str,
         inputs: &[NodeId],
-        config: &LayerConfig,
+        config: &OperatorConfig,
     ) -> Result<Vec<NodeId>, GraphError> {
         unary(graph, name, inputs, config, "Softmax")
     }
@@ -162,7 +166,7 @@ fn unary(
     graph: &mut Graph,
     name: &str,
     inputs: &[NodeId],
-    config: &LayerConfig,
+    config: &OperatorConfig,
     operator: &str,
 ) -> Result<Vec<NodeId>, GraphError> {
     let [input] = inputs else {
@@ -180,7 +184,13 @@ fn unary(
         .ok_or_else(|| GraphError::invalid(format!("{operator} input does not exist")))?
         .shape()
         .clone();
-    let id = graph.add_node(name, Operator::new(operator), inputs.to_vec(), shape)?;
+    let primitive = match operator {
+        "Relu" => Primitive::relu(),
+        "Sigmoid" => Primitive::sigmoid(),
+        "Softmax" => Primitive::softmax(),
+        _ => unreachable!("unary is only used by built-in operators"),
+    };
+    let id = graph.add_node(name, primitive, inputs.to_vec(), shape)?;
     Ok(vec![id])
 }
 
@@ -190,3 +200,6 @@ pub type relu = Relu;
 pub type sigmoid = Sigmoid;
 #[allow(non_camel_case_types)]
 pub type softmax = Softmax;
+
+/// Backwards-compatible name for configuration supplied by `#[layer(...)]`.
+pub type LayerConfig = OperatorConfig;

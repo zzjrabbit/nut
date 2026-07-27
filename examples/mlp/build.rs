@@ -2,12 +2,12 @@ use nut::{Linear, model, relu, sigmoid, softmax};
 
 struct SharedBias;
 
-impl nut::Layer for SharedBias {
-    fn build(
+impl nut::Operator for SharedBias {
+    fn expand(
         graph: &mut nut::Graph,
         name: &str,
         inputs: &[nut::NodeId],
-        _config: &nut::LayerConfig,
+        _config: &nut::OperatorConfig,
     ) -> Result<Vec<nut::NodeId>, nut::GraphError> {
         let [input] = inputs else {
             return Err(nut::GraphError::invalid(
@@ -21,16 +21,16 @@ impl nut::Layer for SharedBias {
             .clone();
         let bias = graph.add_parameter(
             format!("{name}_bias"),
-            nut::Operator::new("Parameter").with_attribute("init", "zeros"),
+            nut::Primitive::parameter().with_attribute("init", "zeros"),
             shape.clone(),
         )?;
         let first = graph.add_node(
             format!("{name}_first"),
-            nut::Operator::new("Add"),
+            nut::Primitive::add(),
             vec![*input, bias],
             shape.clone(),
         )?;
-        let output = graph.add_node(name, nut::Operator::new("Add"), vec![first, bias], shape)?;
+        let output = graph.add_node(name, nut::Primitive::add(), vec![first, bias], shape)?;
         Ok(vec![output])
     }
 }

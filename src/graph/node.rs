@@ -78,13 +78,46 @@ impl From<&str> for AttributeValue {
     }
 }
 
+/// A primitive operation stored in a lowered computation graph.
+///
+/// User-facing operators implement [`crate::Operator`] and expand into one or
+/// more values of this type before a graph artifact is generated.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Operator {
+pub struct Primitive {
     name: String,
     attributes: BTreeMap<String, AttributeValue>,
 }
 
-impl Operator {
+impl Primitive {
+    pub fn input() -> Self {
+        Self::new("Input")
+    }
+
+    pub fn parameter() -> Self {
+        Self::new("Parameter")
+    }
+
+    pub fn mat_mul() -> Self {
+        Self::new("MatMul")
+    }
+
+    pub fn add() -> Self {
+        Self::new("Add")
+    }
+
+    pub fn relu() -> Self {
+        Self::new("Relu")
+    }
+
+    pub fn sigmoid() -> Self {
+        Self::new("Sigmoid")
+    }
+
+    pub fn softmax() -> Self {
+        Self::new("Softmax")
+    }
+
+    /// Creates an extension primitive not included in Nut's built-in set.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -118,7 +151,8 @@ impl Operator {
 pub struct Node {
     pub(crate) id: NodeId,
     pub(crate) name: String,
-    pub(crate) operator: Operator,
+    #[serde(rename = "operator")]
+    pub(crate) primitive: Primitive,
     pub(crate) inputs: Vec<NodeId>,
     pub(crate) shape: Shape,
 }
@@ -132,8 +166,13 @@ impl Node {
         &self.name
     }
 
-    pub fn operator(&self) -> &Operator {
-        &self.operator
+    pub fn primitive(&self) -> &Primitive {
+        &self.primitive
+    }
+
+    /// Compatibility accessor for the serialized `operator` field.
+    pub fn operator(&self) -> &Primitive {
+        self.primitive()
     }
 
     pub fn inputs(&self) -> &[NodeId] {

@@ -9,9 +9,11 @@ basic training:
 
 1. A `#[model]` macro turns a readable Rust model definition into a graph
    generator.
-2. The generator runs in `build.rs`, validates and optimizes the graph, and
-   writes a versioned JSON artifact to `OUT_DIR`.
-3. `#[include_model]` reads that artifact during compilation and generates model
+2. In `build.rs`, each user-facing operator's `Operator::expand` implementation
+   lowers its lightweight shell into graph `Primitive`s.
+3. The generator validates and optimizes that primitive-only graph, then writes
+   a versioned JSON artifact to `OUT_DIR`.
+4. `#[include_model]` reads that artifact during compilation and generates model
    parameters, `forward`, reverse-mode gradients, and a training step.
 
 Training currently supports MSE, binary cross-entropy, or categorical
@@ -113,22 +115,26 @@ See [`examples/mlp`](examples/mlp) for the buildable version.
 
 ## Extension Model
 
-External crates can implement `nut::Layer` to lower a higher-level layer into
-Nut's open graph IR. `Linear` itself lowers to explicit `Parameter`, `MatMul`,
-and `Add` nodes, so parameters participate in graph validation, optimization,
-and automatic differentiation. Runtime and gradient code generation currently
-support `Input`, `Parameter`, `MatMul`, `Add`, `Relu`, `Sigmoid`, and `Softmax`.
+External crates can implement `nut::Operator` to lower a higher-level operator
+into Nut's open primitive graph IR. The types used as model fields are only
+operator shells; they never appear in the serialized graph. `Linear`, for
+example, expands to explicit `Parameter`, `MatMul`, and `Add` primitives, so
+parameters participate in graph validation, optimization, and automatic
+differentiation. Runtime and gradient code generation currently support the
+built-in `Input`, `Parameter`, `MatMul`, `Add`, `Relu`, `Sigmoid`, and `Softmax`
+primitives.
 
 To add a higher-level layer without changing Nut itself:
 
-1. Implement `Layer::build` and lower the layer to the supported primitive
-   operators.
+1. Implement `Operator::expand` and add supported `Primitive` values to the
+   supplied graph. Built-in constructors such as `Primitive::add()` and
+   `Primitive::parameter()` avoid stringly typed primitive names.
 2. Use that layer as a field in the `#[model]` declaration in `build.rs`.
 3. Keep `nut` in both `[dependencies]` and `[build-dependencies]`, write the
    graph artifact from `build.rs`, and load the same file with
    `#[include_model]` in the crate source.
 
-Adding a new primitive operator also requires shape validation in the graph,
+Adding a new primitive also requires shape validation in the graph,
 an implementation in the tensor backend, and forward and gradient generation
 in `nut-macros`. The primitive operator registry in the macro crate is the
 starting point for that work. Change `GRAPH_FORMAT_VERSION` when the serialized

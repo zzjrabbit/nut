@@ -1,4 +1,4 @@
-use crate::graph::{Graph, GraphError, Node, NodeId, Operator};
+use crate::graph::{Graph, GraphError, Node, NodeId, Primitive};
 
 pub struct Cursor<'a> {
     graph: &'a Graph,
@@ -37,8 +37,12 @@ impl<'a> CursorMut<'a> {
         &self.graph.nodes[self.id.index()]
     }
 
-    pub fn set_operator(&mut self, operator: Operator) {
-        self.graph.nodes[self.id.index()].operator = operator;
+    pub fn set_primitive(&mut self, primitive: Primitive) {
+        self.graph.nodes[self.id.index()].primitive = primitive;
+    }
+
+    pub fn set_operator(&mut self, primitive: Primitive) {
+        self.set_primitive(primitive);
     }
 
     pub fn add_input(&mut self, input: NodeId) -> Result<(), GraphError> {

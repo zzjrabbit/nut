@@ -137,7 +137,7 @@ impl Graph {
     }
 
     pub fn add_input(&mut self, name: impl Into<String>, shape: Shape) -> NodeId {
-        let id = self.push_node(name, Operator::new("Input"), Vec::new(), shape);
+        let id = self.push_node(name, Primitive::input(), Vec::new(), shape);
         self.inputs.push(id);
         id
     }
@@ -145,15 +145,15 @@ impl Graph {
     pub fn add_parameter(
         &mut self,
         name: impl Into<String>,
-        operator: Operator,
+        primitive: Primitive,
         shape: Shape,
     ) -> Result<NodeId, GraphError> {
-        if operator.name() != "Parameter" {
+        if primitive.name() != "Parameter" {
             return Err(GraphError::invalid(
                 "parameter nodes must use the Parameter operator",
             ));
         }
-        let id = self.push_node(name, operator, Vec::new(), shape);
+        let id = self.push_node(name, primitive, Vec::new(), shape);
         self.parameters.push(id);
         Ok(id)
     }
@@ -161,7 +161,7 @@ impl Graph {
     pub fn add_node(
         &mut self,
         name: impl Into<String>,
-        operator: Operator,
+        primitive: Primitive,
         inputs: impl Into<Vec<NodeId>>,
         shape: Shape,
     ) -> Result<NodeId, GraphError> {
@@ -175,13 +175,13 @@ impl Graph {
                 )));
             }
         }
-        Ok(self.push_node(name, operator, inputs, shape))
+        Ok(self.push_node(name, primitive, inputs, shape))
     }
 
     fn push_node(
         &mut self,
         name: impl Into<String>,
-        operator: Operator,
+        primitive: Primitive,
         inputs: Vec<NodeId>,
         shape: Shape,
     ) -> NodeId {
@@ -189,7 +189,7 @@ impl Graph {
         self.nodes.push(Node {
             id,
             name: name.into(),
-            operator,
+            primitive,
             inputs,
             shape,
         });
@@ -257,10 +257,10 @@ impl Graph {
         }
         for id in &reverse_order {
             let node = &self.nodes[id.index()];
-            if !supports_gradient(node.operator.name()) {
+            if !supports_gradient(node.primitive.name()) {
                 return Err(GraphError::invalid(format!(
                     "operator {:?} has no gradient rule",
-                    node.operator.name()
+                    node.primitive.name()
                 )));
             }
         }
@@ -323,7 +323,7 @@ impl Graph {
             }
         }
         for input in &self.inputs {
-            if self.nodes[input.index()].operator.name() != "Input" {
+            if self.nodes[input.index()].primitive.name() != "Input" {
                 return Err(GraphError::invalid(format!(
                     "graph input {} is not an Input operator",
                     input.0
@@ -337,7 +337,7 @@ impl Graph {
                     parameter.0
                 )));
             }
-            if self.nodes[parameter.index()].operator.name() != "Parameter" {
+            if self.nodes[parameter.index()].primitive.name() != "Parameter" {
                 return Err(GraphError::invalid(format!(
                     "graph parameter {} is not a Parameter operator",
                     parameter.0
@@ -347,13 +347,13 @@ impl Graph {
 
         self.topological_order_all()?;
         for node in &self.nodes {
-            if node.operator.name() == "Input" && !self.inputs.contains(&node.id) {
+            if node.primitive.name() == "Input" && !self.inputs.contains(&node.id) {
                 return Err(GraphError::invalid(format!(
                     "Input node {} is absent from graph inputs",
                     node.id.0
                 )));
             }
-            if node.operator.name() == "Parameter" && !self.parameters.contains(&node.id) {
+            if node.primitive.name() == "Parameter" && !self.parameters.contains(&node.id) {
                 return Err(GraphError::invalid(format!(
                     "Parameter node {} is absent from graph parameters",
                     node.id.0
@@ -400,7 +400,7 @@ impl Graph {
             }
         }
         for id in &expected_order {
-            let operator = self.nodes[id.index()].operator.name();
+            let operator = self.nodes[id.index()].primitive.name();
             if !supports_gradient(operator) {
                 return Err(GraphError::invalid(format!(
                     "operator {operator:?} has no gradient rule"
@@ -451,12 +451,12 @@ impl Graph {
             .iter()
             .map(|id| self.nodes[id.index()].shape())
             .collect();
-        let expected = match node.operator.name() {
+        let expected = match node.primitive.name() {
             "Input" | "Parameter" => {
                 if !node.inputs.is_empty() {
                     return Err(GraphError::invalid(format!(
                         "operator {:?} requires no inputs",
-                        node.operator.name()
+                        node.primitive.name()
                     )));
                 }
                 return Ok(());
@@ -465,7 +465,7 @@ impl Graph {
                 let [input] = input_shapes.as_slice() else {
                     return Err(GraphError::invalid(format!(
                         "operator {:?} requires exactly one input",
-                        node.operator.name()
+                        node.primitive.name()
                     )));
                 };
                 (*input).clone()
@@ -515,7 +515,7 @@ impl Graph {
         if node.shape != expected {
             return Err(GraphError::invalid(format!(
                 "operator {:?} declares shape {:?}, expected {:?}",
-                node.operator.name(),
+                node.primitive.name(),
                 node.shape.dimensions(),
                 expected.dimensions()
             )));
@@ -606,29 +606,50 @@ fn supports_gradient(operator: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Layer, LayerConfig, Linear, Softmax};
+    use crate::{Linear, Operator, OperatorConfig, Softmax};
 
     fn graph_with_dead_node() -> Graph {
         let mut graph = Graph::named("test");
         let input = graph.add_input("input", Shape::new(vec![4]));
         let output = graph
-            .add_node(
-                "relu",
-                Operator::new("Relu"),
-                vec![input],
-                Shape::new(vec![4]),
-            )
+            .add_node("relu", Primitive::relu(), vec![input], Shape::new(vec![4]))
             .unwrap();
         graph
             .add_node(
                 "dead",
-                Operator::new("Sigmoid"),
+                Primitive::sigmoid(),
                 vec![input],
                 Shape::new(vec![4]),
             )
             .unwrap();
         graph.set_outputs(vec![output]).unwrap();
         graph
+    }
+
+    #[test]
+    fn built_in_primitive_catalog_has_stable_names() {
+        let primitives = [
+            Primitive::input(),
+            Primitive::parameter(),
+            Primitive::mat_mul(),
+            Primitive::add(),
+            Primitive::relu(),
+            Primitive::sigmoid(),
+            Primitive::softmax(),
+        ];
+        let names: Vec<_> = primitives.iter().map(Primitive::name).collect();
+        assert_eq!(
+            names,
+            [
+                "Input",
+                "Parameter",
+                "MatMul",
+                "Add",
+                "Relu",
+                "Sigmoid",
+                "Softmax"
+            ]
+        );
     }
 
     #[test]
@@ -664,17 +685,12 @@ mod tests {
         let mut graph = Graph::named("branch");
         let input = graph.add_input("input", Shape::new(vec![2]));
         let left = graph
-            .add_node(
-                "left",
-                Operator::new("Relu"),
-                vec![input],
-                Shape::new(vec![2]),
-            )
+            .add_node("left", Primitive::relu(), vec![input], Shape::new(vec![2]))
             .unwrap();
         let right = graph
             .add_node(
                 "right",
-                Operator::new("Sigmoid"),
+                Primitive::sigmoid(),
                 vec![input],
                 Shape::new(vec![2]),
             )
@@ -682,7 +698,7 @@ mod tests {
         let output = graph
             .add_node(
                 "output",
-                Operator::new("Add"),
+                Primitive::add(),
                 vec![left, right],
                 Shape::new(vec![2]),
             )
@@ -711,11 +727,11 @@ mod tests {
     fn linear_lowers_to_trainable_primitive_graph() {
         let mut graph = Graph::named("Trainable");
         let input = graph.add_input("input", Shape::new(vec![3]));
-        let output = Linear::build(
+        let output = Linear::expand(
             &mut graph,
             "linear",
             &[input],
-            &LayerConfig::new()
+            &OperatorConfig::new()
                 .with("in_dim", 3usize)
                 .with("out_dim", 2usize),
         )
@@ -724,7 +740,7 @@ mod tests {
         graph.optimize().unwrap();
         graph.prepare_training().unwrap();
 
-        let operators: Vec<_> = graph.nodes().map(|node| node.operator().name()).collect();
+        let operators: Vec<_> = graph.nodes().map(|node| node.primitive().name()).collect();
         assert_eq!(
             operators,
             ["Input", "Parameter", "MatMul", "Parameter", "Add"]
@@ -746,14 +762,14 @@ mod tests {
         let parameter = graph
             .add_parameter(
                 "weight",
-                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Primitive::parameter().with_attribute("init", "zeros"),
                 Shape::new(vec![1]),
             )
             .unwrap();
         let output = graph
             .add_node(
                 "output",
-                Operator::new("Add"),
+                Primitive::add(),
                 vec![input, parameter],
                 Shape::new(vec![1]),
             )
@@ -765,17 +781,19 @@ mod tests {
         assert_eq!(artifact["version"], GRAPH_FORMAT_VERSION);
         assert_eq!(artifact["parameters"], serde_json::json!([1]));
         assert!(artifact["gradient_plan"].is_object());
+        assert_eq!(artifact["nodes"][2]["operator"]["name"], "Add");
+        assert!(artifact["nodes"][2].get("primitive").is_none());
     }
 
     #[test]
     fn linear_rejects_zero_dimensions() {
         let mut graph = Graph::named("Invalid");
         let input = graph.add_input("input", Shape::new(vec![0]));
-        let error = Linear::build(
+        let error = Linear::expand(
             &mut graph,
             "linear",
             &[input],
-            &LayerConfig::new()
+            &OperatorConfig::new()
                 .with("in_dim", 0usize)
                 .with("out_dim", 1usize),
         )
@@ -791,23 +809,23 @@ mod tests {
         let parameter = graph
             .add_parameter(
                 "bias",
-                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Primitive::parameter().with_attribute("init", "zeros"),
                 Shape::new(vec![3]),
             )
             .unwrap();
         let logits = graph
             .add_node(
                 "logits",
-                Operator::new("Add"),
+                Primitive::add(),
                 vec![input, parameter],
                 Shape::new(vec![3]),
             )
             .unwrap();
-        let output = Softmax::build(
+        let output = Softmax::expand(
             &mut graph,
             "probabilities",
             &[logits],
-            &LayerConfig::new().with("foreach", true),
+            &OperatorConfig::new().with("foreach", true),
         )
         .unwrap();
         graph.set_outputs(output).unwrap();
@@ -815,7 +833,7 @@ mod tests {
         graph.prepare_training().unwrap();
 
         let output = graph.node(graph.outputs()[0]).unwrap();
-        assert_eq!(output.operator().name(), "Softmax");
+        assert_eq!(output.primitive().name(), "Softmax");
         assert_eq!(output.shape().dimensions(), &[3]);
     }
 
@@ -826,14 +844,14 @@ mod tests {
         let parameter = graph
             .add_parameter(
                 "weight",
-                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Primitive::parameter().with_attribute("init", "zeros"),
                 Shape::new(vec![1]),
             )
             .unwrap();
         let output = graph
             .add_node(
                 "output",
-                Operator::new("Add"),
+                Primitive::add(),
                 vec![input, parameter],
                 Shape::new(vec![1]),
             )
@@ -883,7 +901,7 @@ mod tests {
         graph
             .add_parameter(
                 "unused",
-                Operator::new("Parameter").with_attribute("init", "zeros"),
+                Primitive::parameter().with_attribute("init", "zeros"),
                 Shape::new(vec![1]),
             )
             .unwrap();

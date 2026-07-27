@@ -39,8 +39,8 @@ pub(crate) fn expand(arguments: TokenStream, item: ItemStruct) -> syn::Result<To
         let config_tokens = attributes_to_tokens(&layer_attributes)?;
         let layer_type: &Type = &field.ty;
         layer_steps.push(quote! {
-            let __config = ::nut::LayerConfig::new() #(.with #config_tokens)*;
-            let __outputs = <#layer_type as ::nut::Layer>::build(
+            let __config = ::nut::OperatorConfig::new() #(.with #config_tokens)*;
+            let __outputs = <#layer_type as ::nut::Operator>::expand(
                 &mut __graph,
                 stringify!(#field_name),
                 &[__current],
@@ -273,8 +273,9 @@ mod tests {
         let generated = expand(quote!(in_dim = 10, out_dim = 1), item)
             .unwrap()
             .to_string();
-        assert!(generated.contains("LayerConfig"));
-        assert!(generated.contains(":: build"));
+        assert!(generated.contains("OperatorConfig"));
+        assert!(generated.contains(":: nut :: Operator"));
+        assert!(generated.contains(":: expand"));
         assert!(generated.contains("write_graph"));
     }
 
