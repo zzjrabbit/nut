@@ -1,0 +1,13 @@
+[package]
+name = "nut-mnist-example"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+flate2 = "1.1.9"
+nut = { path = "../.." }
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
+
+[build-dependencies]
+nut = { path = "../.." }

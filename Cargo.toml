@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["examples/mlp", "macros"]
+members = ["examples/mlp", "examples/mnist", "macros"]
 default-members = ["examples/mlp"]
 
 [workspace.dependencies]
