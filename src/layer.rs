@@ -35,6 +35,13 @@ impl OperatorConfig {
         }
     }
 
+    pub fn usize_or(&self, name: &str, default: usize) -> Result<usize, GraphError> {
+        match self.get(name) {
+            Some(_) => self.usize(name),
+            None => Ok(default),
+        }
+    }
+
     pub fn bool(&self, name: &str) -> Result<bool, GraphError> {
         match self.get(name) {
             Some(AttributeValue::Bool(value)) => Ok(*value),
@@ -123,6 +130,153 @@ impl Operator for Linear {
     }
 }
 
+pub struct Conv2d;
+
+impl Operator for Conv2d {
+    fn expand(
+        graph: &mut Graph,
+        name: &str,
+        inputs: &[NodeId],
+        config: &OperatorConfig,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        let [input] = inputs else {
+            return Err(GraphError::invalid("Conv2d requires exactly one input"));
+        };
+        let input_shape = graph
+            .node(*input)
+            .ok_or_else(|| GraphError::invalid("Conv2d input does not exist"))?
+            .shape()
+            .dimensions();
+        let [input_channels, input_height, input_width] = input_shape else {
+            return Err(GraphError::invalid(format!(
+                "Conv2d {name:?} expects an input shape of [channels, height, width], got {input_shape:?}"
+            )));
+        };
+        let in_channels = config.usize("in_channels")?;
+        let out_channels = config.usize("out_channels")?;
+        let kernel_size = config.usize("kernel_size")?;
+        let stride = config.usize_or("stride", 1)?;
+        let padding = config.usize_or("padding", 0)?;
+        if in_channels == 0 || out_channels == 0 || kernel_size == 0 || stride == 0 {
+            return Err(GraphError::invalid(format!(
+                "Conv2d {name:?} channels, kernel_size, and stride must be greater than zero"
+            )));
+        }
+        if *input_channels != in_channels {
+            return Err(GraphError::invalid(format!(
+                "Conv2d {name:?} expects {in_channels} input channels, got {input_channels}"
+            )));
+        }
+        let output_height =
+            convolution_output_size(*input_height, kernel_size, stride, padding, name, "height")?;
+        let output_width =
+            convolution_output_size(*input_width, kernel_size, stride, padding, name, "width")?;
+        let fan_in = in_channels
+            .checked_mul(kernel_size)
+            .and_then(|value| value.checked_mul(kernel_size))
+            .ok_or_else(|| GraphError::invalid(format!("Conv2d {name:?} fan-in overflows")))?;
+        let weight = graph.add_parameter(
+            format!("{name}_weight"),
+            Primitive::parameter()
+                .with_attribute("init", "normal")
+                .with_attribute("scale", (2.0 / fan_in as f64).sqrt()),
+            Shape::new(vec![out_channels, in_channels, kernel_size, kernel_size]),
+        )?;
+        let bias = graph.add_parameter(
+            format!("{name}_bias"),
+            Primitive::parameter().with_attribute("init", "zeros"),
+            Shape::new(vec![out_channels]),
+        )?;
+        let output = graph.add_node(
+            name,
+            Primitive::conv2d()
+                .with_attribute("stride", stride)
+                .with_attribute("padding", padding),
+            vec![*input, weight, bias],
+            Shape::new(vec![out_channels, output_height, output_width]),
+        )?;
+        Ok(vec![output])
+    }
+}
+
+pub struct Flatten;
+
+impl Operator for Flatten {
+    fn expand(
+        graph: &mut Graph,
+        name: &str,
+        inputs: &[NodeId],
+        _config: &OperatorConfig,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        let [input] = inputs else {
+            return Err(GraphError::invalid("Flatten requires exactly one input"));
+        };
+        let input_shape = graph
+            .node(*input)
+            .ok_or_else(|| GraphError::invalid("Flatten input does not exist"))?
+            .shape()
+            .dimensions();
+        if input_shape.is_empty() {
+            return Err(GraphError::invalid("Flatten input cannot be scalar"));
+        }
+        let feature_count = input_shape.iter().try_fold(1usize, |count, dimension| {
+            count.checked_mul(*dimension).ok_or_else(|| {
+                GraphError::invalid(format!("Flatten {name:?} feature count overflows"))
+            })
+        })?;
+        let output = graph.add_node(
+            name,
+            Primitive::flatten(),
+            vec![*input],
+            Shape::new(vec![feature_count]),
+        )?;
+        Ok(vec![output])
+    }
+}
+
+pub struct MaxPool2d;
+
+impl Operator for MaxPool2d {
+    fn expand(
+        graph: &mut Graph,
+        name: &str,
+        inputs: &[NodeId],
+        config: &OperatorConfig,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        let [input] = inputs else {
+            return Err(GraphError::invalid("MaxPool2d requires exactly one input"));
+        };
+        let input_shape = graph
+            .node(*input)
+            .ok_or_else(|| GraphError::invalid("MaxPool2d input does not exist"))?
+            .shape()
+            .dimensions();
+        let [channels, input_height, input_width] = input_shape else {
+            return Err(GraphError::invalid(format!(
+                "MaxPool2d {name:?} expects an input shape of [channels, height, width], got {input_shape:?}"
+            )));
+        };
+        let kernel_size = config.usize_or("kernel_size", 2)?;
+        let stride = config.usize_or("stride", kernel_size)?;
+        let padding = config.usize_or("padding", 0)?;
+        validate_max_pool_attributes(kernel_size, stride, padding, name)?;
+        let output_height =
+            max_pool_output_size(*input_height, kernel_size, stride, padding, name, "height")?;
+        let output_width =
+            max_pool_output_size(*input_width, kernel_size, stride, padding, name, "width")?;
+        let output = graph.add_node(
+            name,
+            Primitive::max_pool2d()
+                .with_attribute("kernel_size", kernel_size)
+                .with_attribute("stride", stride)
+                .with_attribute("padding", padding),
+            vec![*input],
+            Shape::new(vec![*channels, output_height, output_width]),
+        )?;
+        Ok(vec![output])
+    }
+}
+
 pub struct Relu;
 
 impl Operator for Relu {
@@ -162,6 +316,71 @@ impl Operator for Softmax {
     }
 }
 
+fn convolution_output_size(
+    input_size: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    name: &str,
+    dimension: &str,
+) -> Result<usize, GraphError> {
+    let padded = input_size
+        .checked_add(
+            padding
+                .checked_mul(2)
+                .ok_or_else(|| GraphError::invalid(format!("Conv2d {name:?} padding overflows")))?,
+        )
+        .ok_or_else(|| GraphError::invalid(format!("Conv2d {name:?} padded size overflows")))?;
+    if kernel_size > padded {
+        return Err(GraphError::invalid(format!(
+            "Conv2d {name:?} kernel_size {kernel_size} exceeds padded input {dimension} {padded}"
+        )));
+    }
+    Ok((padded - kernel_size) / stride + 1)
+}
+
+fn validate_max_pool_attributes(
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    name: &str,
+) -> Result<(), GraphError> {
+    if kernel_size == 0 || stride == 0 {
+        return Err(GraphError::invalid(format!(
+            "MaxPool2d {name:?} kernel_size and stride must be greater than zero"
+        )));
+    }
+    if padding > kernel_size / 2 {
+        return Err(GraphError::invalid(format!(
+            "MaxPool2d {name:?} padding must not exceed half the kernel_size"
+        )));
+    }
+    Ok(())
+}
+
+fn max_pool_output_size(
+    input_size: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    name: &str,
+    dimension: &str,
+) -> Result<usize, GraphError> {
+    let padded = input_size
+        .checked_add(
+            padding.checked_mul(2).ok_or_else(|| {
+                GraphError::invalid(format!("MaxPool2d {name:?} padding overflows"))
+            })?,
+        )
+        .ok_or_else(|| GraphError::invalid(format!("MaxPool2d {name:?} padded size overflows")))?;
+    if kernel_size > padded {
+        return Err(GraphError::invalid(format!(
+            "MaxPool2d {name:?} kernel_size {kernel_size} exceeds padded input {dimension} {padded}"
+        )));
+    }
+    Ok((padded - kernel_size) / stride + 1)
+}
+
 fn unary(
     graph: &mut Graph,
     name: &str,
@@ -196,6 +415,12 @@ fn unary(
 
 #[allow(non_camel_case_types)]
 pub type relu = Relu;
+#[allow(non_camel_case_types)]
+pub type conv2d = Conv2d;
+#[allow(non_camel_case_types)]
+pub type flatten = Flatten;
+#[allow(non_camel_case_types)]
+pub type max_pool2d = MaxPool2d;
 #[allow(non_camel_case_types)]
 pub type sigmoid = Sigmoid;
 #[allow(non_camel_case_types)]

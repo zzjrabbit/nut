@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 flate2 = "1.1.9"
 nut = { path = "../.." }
+rand = "0.10.0"
 tar = { version = "0.4.44", default-features = false }
 ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 

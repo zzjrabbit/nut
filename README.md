@@ -18,8 +18,8 @@ basic training:
 
 Training currently supports MSE, binary cross-entropy, or categorical
 cross-entropy loss and either SGD or Adam for graphs built from `MatMul`, `Add`,
-`Relu`, `Sigmoid`, and `Softmax`. More losses, optimizers, and graph-level
-performance optimizations are not implemented yet.
+`Conv2d`, `MaxPool2d`, `Flatten`, `Relu`, `Sigmoid`, and `Softmax`. More losses,
+optimizers, and graph-level performance optimizations are not implemented yet.
 
 ## Example
 
@@ -124,8 +124,8 @@ operator shells; they never appear in the serialized graph. `Linear`, for
 example, expands to explicit `Parameter`, `MatMul`, and `Add` primitives, so
 parameters participate in graph validation, optimization, and automatic
 differentiation. Runtime and gradient code generation currently support the
-built-in `Input`, `Parameter`, `MatMul`, `Add`, `Relu`, `Sigmoid`, and `Softmax`
-primitives.
+built-in `Input`, `Parameter`, `MatMul`, `Add`, `Conv2d`, `MaxPool2d`, `Flatten`,
+`Relu`, `Sigmoid`, and `Softmax` primitives.
 
 To add a higher-level layer without changing Nut itself:
 
@@ -157,9 +157,14 @@ artifact schema changes, rather than for an operator-only addition.
 - Training uses an in-place SGD update by default. `optimizer = "adam"` enables
   Adam with bias correction. In both cases, the learning rate must be finite
   and non-negative.
-- Runtime `MatMul` is two-dimensional. `Add` follows `ndarray` broadcasting,
-  and its generated gradient reduces back to each input shape. `Softmax`
-  operates along the last dimension.
+- Runtime `MatMul` is two-dimensional. `Conv2d` uses NCHW input tensors and
+  OIHW kernels. `Conv2d` and `MaxPool2d` use scalar square-window
+  `kernel_size`, `stride`, and `padding` layer attributes. `MaxPool2d` defaults
+  to a 2x2 window with stride 2 and routes each output gradient to the first
+  maximum in its window. `Flatten` preserves the batch axis and flattens all
+  feature axes. `Add` follows `ndarray` broadcasting, and its generated
+  gradient reduces back to each input shape. `Softmax` operates along the last
+  dimension.
 - Training artifacts must contain a complete gradient plan. Every parameter
   must be reachable from the output, and every reachable operator must have a
   gradient rule.

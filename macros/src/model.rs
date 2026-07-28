@@ -23,7 +23,7 @@ pub(crate) fn expand(arguments: TokenStream, item: ItemStruct) -> syn::Result<To
     };
 
     let model_attributes = parse_meta_list.parse2(arguments)?;
-    let in_dim = required_usize(&model_attributes, "in_dim")?;
+    let input_dimensions = input_dimensions(&model_attributes)?;
     let out_dim = required_usize(&model_attributes, "out_dim")?;
     validate_loss_attribute(&model_attributes)?;
     validate_optimizer_attribute(&model_attributes)?;
@@ -75,7 +75,7 @@ pub(crate) fn expand(arguments: TokenStream, item: ItemStruct) -> syn::Result<To
                 #(__graph.set_attribute #model_attribute_tokens;)*
                 let mut __current = __graph.add_input(
                     "input",
-                    ::nut::Shape::new(vec![#in_dim]),
+                    ::nut::Shape::new(vec![#(#input_dimensions),*]),
                 );
                 #(#layer_steps)*
                 let __actual_out = __graph
@@ -148,6 +148,61 @@ fn required_usize(attributes: &Punctuated<Meta, Token![,]>, name: &str) -> syn::
         Span::call_site(),
         format!("missing required model attribute {name:?}"),
     ))
+}
+
+fn input_dimensions(attributes: &Punctuated<Meta, Token![,]>) -> syn::Result<Vec<usize>> {
+    let image_dimensions = [
+        optional_usize(attributes, "in_channels")?,
+        optional_usize(attributes, "in_height")?,
+        optional_usize(attributes, "in_width")?,
+    ];
+    if image_dimensions.iter().all(Option::is_none) {
+        return Ok(vec![required_usize(attributes, "in_dim")?]);
+    }
+    if image_dimensions.iter().any(Option::is_none) {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "image models must specify in_channels, in_height, and in_width together",
+        ));
+    }
+    if optional_usize(attributes, "in_dim")?.is_some() {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "specify either in_dim or in_channels/in_height/in_width, not both",
+        ));
+    }
+    let dimensions: Vec<_> = image_dimensions.into_iter().map(Option::unwrap).collect();
+    if dimensions.contains(&0) {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "image input dimensions must be greater than zero",
+        ));
+    }
+    Ok(dimensions)
+}
+
+fn optional_usize(
+    attributes: &Punctuated<Meta, Token![,]>,
+    name: &str,
+) -> syn::Result<Option<usize>> {
+    for attribute in attributes {
+        if let Meta::NameValue(value) = attribute
+            && value.path.is_ident(name)
+        {
+            let Expr::Lit(ExprLit {
+                lit: Lit::Int(value),
+                ..
+            }) = &value.value
+            else {
+                return Err(syn::Error::new_spanned(
+                    &value.value,
+                    format!("{name} must be a non-negative integer"),
+                ));
+            };
+            return value.base10_parse().map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn validate_loss_attribute(attributes: &Punctuated<Meta, Token![,]>) -> syn::Result<()> {

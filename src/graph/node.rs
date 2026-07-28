@@ -105,6 +105,18 @@ impl Primitive {
         Self::new("Add")
     }
 
+    pub fn conv2d() -> Self {
+        Self::new("Conv2d")
+    }
+
+    pub fn max_pool2d() -> Self {
+        Self::new("MaxPool2d")
+    }
+
+    pub fn flatten() -> Self {
+        Self::new("Flatten")
+    }
+
     pub fn relu() -> Self {
         Self::new("Relu")
     }

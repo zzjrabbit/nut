@@ -1,6 +1,6 @@
 use std::ops::{Add, Mul, Sub};
 
-use ndarray::{Axis, Ix2, IxDyn};
+use ndarray::{Axis, Ix1, Ix2, Ix4, IxDyn};
 use rand::RngExt;
 use rand_distr::{Distribution, StandardNormal, StandardUniform};
 
@@ -50,8 +50,327 @@ impl NdTensor<f32> {
         Self::from_inner(lhs.dot(&rhs).into_dyn().into_shared())
     }
 
+    pub(crate) fn conv2d(&self, weight: &Self, bias: &Self, stride: usize, padding: usize) -> Self {
+        let input = self
+            .inner
+            .view()
+            .into_dimensionality::<Ix4>()
+            .expect("Conv2d input must have rank 4 [batch, channels, height, width]");
+        let weight =
+            weight.inner.view().into_dimensionality::<Ix4>().expect(
+                "Conv2d weight must have rank 4 [out_channels, in_channels, height, width]",
+            );
+        let bias = bias
+            .inner
+            .view()
+            .into_dimensionality::<Ix1>()
+            .expect("Conv2d bias must have rank 1 [out_channels]");
+        let (batch_size, input_channels, input_height, input_width) = input.dim();
+        let (output_channels, weight_channels, kernel_height, kernel_width) = weight.dim();
+        assert_eq!(
+            input_channels, weight_channels,
+            "Conv2d input and weight channel counts must match",
+        );
+        assert_eq!(
+            output_channels,
+            bias.len(),
+            "Conv2d bias length must equal the output channel count",
+        );
+        let (output_height, output_width) = conv2d_output_dimensions(
+            input_height,
+            input_width,
+            kernel_height,
+            kernel_width,
+            stride,
+            padding,
+        );
+        let mut output =
+            ndarray::Array4::zeros((batch_size, output_channels, output_height, output_width));
+        for batch in 0..batch_size {
+            for output_channel in 0..output_channels {
+                for output_y in 0..output_height {
+                    for output_x in 0..output_width {
+                        let mut value = bias[output_channel];
+                        for input_channel in 0..input_channels {
+                            for kernel_y in 0..kernel_height {
+                                let input_y = output_y * stride + kernel_y;
+                                let Some(input_y) = input_y.checked_sub(padding) else {
+                                    continue;
+                                };
+                                if input_y >= input_height {
+                                    continue;
+                                }
+                                for kernel_x in 0..kernel_width {
+                                    let input_x = output_x * stride + kernel_x;
+                                    let Some(input_x) = input_x.checked_sub(padding) else {
+                                        continue;
+                                    };
+                                    if input_x >= input_width {
+                                        continue;
+                                    }
+                                    value += input[[batch, input_channel, input_y, input_x]]
+                                        * weight
+                                            [[output_channel, input_channel, kernel_y, kernel_x]];
+                                }
+                            }
+                        }
+                        output[[batch, output_channel, output_y, output_x]] = value;
+                    }
+                }
+            }
+        }
+        Self::from_inner(output.into_dyn().into_shared())
+    }
+
+    pub(crate) fn conv2d_backward(
+        &self,
+        weight: &Self,
+        gradient: &Self,
+        stride: usize,
+        padding: usize,
+    ) -> (Self, Self, Self) {
+        let input = self
+            .inner
+            .view()
+            .into_dimensionality::<Ix4>()
+            .expect("Conv2d input must have rank 4 [batch, channels, height, width]");
+        let weight =
+            weight.inner.view().into_dimensionality::<Ix4>().expect(
+                "Conv2d weight must have rank 4 [out_channels, in_channels, height, width]",
+            );
+        let gradient = gradient
+            .inner
+            .view()
+            .into_dimensionality::<Ix4>()
+            .expect("Conv2d gradient must have rank 4 [batch, channels, height, width]");
+        let (batch_size, input_channels, input_height, input_width) = input.dim();
+        let (output_channels, weight_channels, kernel_height, kernel_width) = weight.dim();
+        assert_eq!(
+            input_channels, weight_channels,
+            "Conv2d input and weight channel counts must match",
+        );
+        let (output_height, output_width) = conv2d_output_dimensions(
+            input_height,
+            input_width,
+            kernel_height,
+            kernel_width,
+            stride,
+            padding,
+        );
+        assert_eq!(
+            gradient.dim(),
+            (batch_size, output_channels, output_height, output_width),
+            "Conv2d gradient shape must match the output shape",
+        );
+
+        let mut input_gradient = ndarray::Array4::zeros(input.dim());
+        let mut weight_gradient = ndarray::Array4::zeros(weight.dim());
+        let mut bias_gradient = ndarray::Array1::zeros(output_channels);
+        for batch in 0..batch_size {
+            for output_channel in 0..output_channels {
+                for output_y in 0..output_height {
+                    for output_x in 0..output_width {
+                        let local_gradient = gradient[[batch, output_channel, output_y, output_x]];
+                        bias_gradient[output_channel] += local_gradient;
+                        for input_channel in 0..input_channels {
+                            for kernel_y in 0..kernel_height {
+                                let input_y = output_y * stride + kernel_y;
+                                let Some(input_y) = input_y.checked_sub(padding) else {
+                                    continue;
+                                };
+                                if input_y >= input_height {
+                                    continue;
+                                }
+                                for kernel_x in 0..kernel_width {
+                                    let input_x = output_x * stride + kernel_x;
+                                    let Some(input_x) = input_x.checked_sub(padding) else {
+                                        continue;
+                                    };
+                                    if input_x >= input_width {
+                                        continue;
+                                    }
+                                    input_gradient[[batch, input_channel, input_y, input_x]] +=
+                                        local_gradient
+                                            * weight[[
+                                                output_channel,
+                                                input_channel,
+                                                kernel_y,
+                                                kernel_x,
+                                            ]];
+                                    weight_gradient
+                                        [[output_channel, input_channel, kernel_y, kernel_x]] +=
+                                        local_gradient
+                                            * input[[batch, input_channel, input_y, input_x]];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (
+            Self::from_inner(input_gradient.into_dyn().into_shared()),
+            Self::from_inner(weight_gradient.into_dyn().into_shared()),
+            Self::from_inner(bias_gradient.into_dyn().into_shared()),
+        )
+    }
+
+    pub(crate) fn max_pool2d(&self, kernel_size: usize, stride: usize, padding: usize) -> Self {
+        let input = self
+            .inner
+            .view()
+            .into_dimensionality::<Ix4>()
+            .expect("MaxPool2d input must have rank 4 [batch, channels, height, width]");
+        let (batch_size, channels, input_height, input_width) = input.dim();
+        let (output_height, output_width) =
+            max_pool2d_output_dimensions(input_height, input_width, kernel_size, stride, padding);
+        let mut output =
+            ndarray::Array4::zeros((batch_size, channels, output_height, output_width));
+        for batch in 0..batch_size {
+            for channel in 0..channels {
+                for output_y in 0..output_height {
+                    for output_x in 0..output_width {
+                        let mut maximum = f32::NEG_INFINITY;
+                        let mut has_maximum = false;
+                        for kernel_y in 0..kernel_size {
+                            let input_y = output_y * stride + kernel_y;
+                            let Some(input_y) = input_y.checked_sub(padding) else {
+                                continue;
+                            };
+                            if input_y >= input_height {
+                                continue;
+                            }
+                            for kernel_x in 0..kernel_size {
+                                let input_x = output_x * stride + kernel_x;
+                                let Some(input_x) = input_x.checked_sub(padding) else {
+                                    continue;
+                                };
+                                if input_x >= input_width {
+                                    continue;
+                                }
+                                let value = input[[batch, channel, input_y, input_x]];
+                                if !has_maximum || value > maximum {
+                                    maximum = value;
+                                    has_maximum = true;
+                                }
+                            }
+                        }
+                        assert!(
+                            has_maximum,
+                            "MaxPool2d pooling window must overlap the input"
+                        );
+                        output[[batch, channel, output_y, output_x]] = maximum;
+                    }
+                }
+            }
+        }
+        Self::from_inner(output.into_dyn().into_shared())
+    }
+
+    pub(crate) fn max_pool2d_backward(
+        &self,
+        gradient: &Self,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Self {
+        let input = self
+            .inner
+            .view()
+            .into_dimensionality::<Ix4>()
+            .expect("MaxPool2d input must have rank 4 [batch, channels, height, width]");
+        let gradient = gradient
+            .inner
+            .view()
+            .into_dimensionality::<Ix4>()
+            .expect("MaxPool2d gradient must have rank 4 [batch, channels, height, width]");
+        let (batch_size, channels, input_height, input_width) = input.dim();
+        let (output_height, output_width) =
+            max_pool2d_output_dimensions(input_height, input_width, kernel_size, stride, padding);
+        assert_eq!(
+            gradient.dim(),
+            (batch_size, channels, output_height, output_width),
+            "MaxPool2d gradient shape must match the output shape",
+        );
+
+        let mut input_gradient = ndarray::Array4::zeros(input.dim());
+        for batch in 0..batch_size {
+            for channel in 0..channels {
+                for output_y in 0..output_height {
+                    for output_x in 0..output_width {
+                        let mut maximum = f32::NEG_INFINITY;
+                        let mut maximum_index = None;
+                        for kernel_y in 0..kernel_size {
+                            let input_y = output_y * stride + kernel_y;
+                            let Some(input_y) = input_y.checked_sub(padding) else {
+                                continue;
+                            };
+                            if input_y >= input_height {
+                                continue;
+                            }
+                            for kernel_x in 0..kernel_size {
+                                let input_x = output_x * stride + kernel_x;
+                                let Some(input_x) = input_x.checked_sub(padding) else {
+                                    continue;
+                                };
+                                if input_x >= input_width {
+                                    continue;
+                                }
+                                let value = input[[batch, channel, input_y, input_x]];
+                                if maximum_index.is_none() || value > maximum {
+                                    maximum = value;
+                                    maximum_index = Some((input_y, input_x));
+                                }
+                            }
+                        }
+                        let (input_y, input_x) =
+                            maximum_index.expect("MaxPool2d pooling window must overlap the input");
+                        input_gradient[[batch, channel, input_y, input_x]] +=
+                            gradient[[batch, channel, output_y, output_x]];
+                    }
+                }
+            }
+        }
+        Self::from_inner(input_gradient.into_dyn().into_shared())
+    }
+
     pub(crate) fn add_tensor(&self, rhs: &Self) -> Self {
         Self::from_inner((&self.inner + &rhs.inner).into_shared())
+    }
+
+    pub(crate) fn flatten_features(&self) -> Self {
+        assert!(
+            self.inner.ndim() >= 2,
+            "Flatten requires a batched tensor with at least two dimensions"
+        );
+        let batch_size = self.inner.shape()[0];
+        assert!(batch_size > 0, "Flatten requires a non-empty batch");
+        let feature_count = self.inner.len() / batch_size;
+        Self::from_inner(
+            self.inner
+                .clone()
+                .into_shape_with_order(IxDyn(&[batch_size, feature_count]))
+                .expect("Flatten shape preserves tensor size"),
+        )
+    }
+
+    pub(crate) fn reshape(&self, shape: &[usize]) -> Self {
+        let target_size = shape.iter().fold(1usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .expect("reshape target size overflows")
+        });
+        assert_eq!(
+            self.inner.len(),
+            target_size,
+            "reshape target shape must preserve tensor size",
+        );
+        Self::from_inner(
+            self.inner
+                .clone()
+                .into_shape_with_order(IxDyn(shape))
+                .expect("reshape target size was validated"),
+        )
     }
 
     pub(crate) fn relu(&self) -> Self {
@@ -422,6 +741,76 @@ impl NdTensor<f32> {
     }
 }
 
+fn conv2d_output_dimensions(
+    input_height: usize,
+    input_width: usize,
+    kernel_height: usize,
+    kernel_width: usize,
+    stride: usize,
+    padding: usize,
+) -> (usize, usize) {
+    assert!(stride > 0, "Conv2d stride must be greater than zero");
+    let padding = padding
+        .checked_mul(2)
+        .expect("Conv2d padding must not overflow");
+    let padded_height = input_height
+        .checked_add(padding)
+        .expect("Conv2d padded height must not overflow");
+    let padded_width = input_width
+        .checked_add(padding)
+        .expect("Conv2d padded width must not overflow");
+    assert!(
+        kernel_height <= padded_height,
+        "Conv2d kernel height must not exceed the padded input height",
+    );
+    assert!(
+        kernel_width <= padded_width,
+        "Conv2d kernel width must not exceed the padded input width",
+    );
+    (
+        (padded_height - kernel_height) / stride + 1,
+        (padded_width - kernel_width) / stride + 1,
+    )
+}
+
+fn max_pool2d_output_dimensions(
+    input_height: usize,
+    input_width: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> (usize, usize) {
+    assert!(
+        kernel_size > 0 && stride > 0,
+        "MaxPool2d kernel_size and stride must be greater than zero"
+    );
+    assert!(
+        padding <= kernel_size / 2,
+        "MaxPool2d padding must not exceed half the kernel_size"
+    );
+    let padding = padding
+        .checked_mul(2)
+        .expect("MaxPool2d padding must not overflow");
+    let padded_height = input_height
+        .checked_add(padding)
+        .expect("MaxPool2d padded height must not overflow");
+    let padded_width = input_width
+        .checked_add(padding)
+        .expect("MaxPool2d padded width must not overflow");
+    assert!(
+        kernel_size <= padded_height,
+        "MaxPool2d kernel_size must not exceed the padded input height",
+    );
+    assert!(
+        kernel_size <= padded_width,
+        "MaxPool2d kernel_size must not exceed the padded input width",
+    );
+    (
+        (padded_height - kernel_size) / stride + 1,
+        (padded_width - kernel_size) / stride + 1,
+    )
+}
+
 impl<T: DType> TensorOps for NdTensor<T> {
     fn shape(&self) -> &[usize] {
         self.inner.shape()
@@ -491,6 +880,90 @@ mod tests {
         let bias = NdTensor::from_vec(&[2], vec![1.0, 1.0]).unwrap();
         let output = input.matmul(&weights).add_tensor(&bias).relu();
         assert_eq!(output.to_vec(), vec![3.0, 0.0]);
+    }
+
+    #[test]
+    fn conv2d_forward_and_backward_have_expected_values() {
+        let input =
+            NdTensor::from_vec(&[1, 1, 3, 3], (1..=9).map(|value| value as f32).collect()).unwrap();
+        let weight = NdTensor::from_vec(&[1, 1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let bias = NdTensor::from_vec(&[1], vec![1.0]).unwrap();
+
+        let output = input.conv2d(&weight, &bias, 1, 0);
+        assert_eq!(output.shape(), &[1, 1, 2, 2]);
+        assert_eq!(output.to_vec(), vec![38.0, 48.0, 68.0, 78.0]);
+
+        let output_gradient = NdTensor::from_vec(&[1, 1, 2, 2], vec![1.0; 4]).unwrap();
+        let (input_gradient, weight_gradient, bias_gradient) =
+            input.conv2d_backward(&weight, &output_gradient, 1, 0);
+        assert_eq!(
+            input_gradient.to_vec(),
+            vec![1.0, 3.0, 2.0, 4.0, 10.0, 6.0, 3.0, 7.0, 4.0]
+        );
+        assert_eq!(weight_gradient.to_vec(), vec![12.0, 16.0, 24.0, 28.0]);
+        assert_eq!(bias_gradient.to_vec(), vec![4.0]);
+    }
+
+    #[test]
+    fn conv2d_supports_stride_and_padding() {
+        let input =
+            NdTensor::from_vec(&[1, 1, 3, 3], (1..=9).map(|value| value as f32).collect()).unwrap();
+        let weight = NdTensor::from_vec(&[1, 1, 3, 3], vec![1.0; 9]).unwrap();
+        let bias = NdTensor::from_vec(&[1], vec![0.0]).unwrap();
+
+        let output = input.conv2d(&weight, &bias, 2, 1);
+
+        assert_eq!(output.shape(), &[1, 1, 2, 2]);
+        assert_eq!(output.to_vec(), vec![12.0, 16.0, 24.0, 28.0]);
+    }
+
+    #[test]
+    fn max_pool2d_forward_and_backward_have_expected_values() {
+        let input = NdTensor::from_vec(
+            &[1, 1, 3, 4],
+            vec![1.0, 3.0, 2.0, 0.0, 4.0, 6.0, 5.0, 1.0, 7.0, 8.0, 9.0, 2.0],
+        )
+        .unwrap();
+
+        let output = input.max_pool2d(2, 1, 0);
+
+        assert_eq!(output.shape(), &[1, 1, 2, 3]);
+        assert_eq!(output.to_vec(), vec![6.0, 6.0, 5.0, 8.0, 9.0, 9.0]);
+
+        let output_gradient =
+            NdTensor::from_vec(&[1, 1, 2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let input_gradient = input.max_pool2d_backward(&output_gradient, 2, 1, 0);
+        assert_eq!(
+            input_gradient.to_vec(),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 4.0, 11.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn max_pool2d_supports_padding_and_routes_ties_deterministically() {
+        let input = NdTensor::from_vec(&[1, 1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let padded = input.max_pool2d(2, 1, 1);
+        assert_eq!(padded.shape(), &[1, 1, 3, 3]);
+        assert_eq!(
+            padded.to_vec(),
+            vec![1.0, 2.0, 2.0, 3.0, 4.0, 4.0, 3.0, 4.0, 4.0]
+        );
+
+        let tied = NdTensor::from_vec(&[1, 1, 2, 2], vec![1.0; 4]).unwrap();
+        let output_gradient = NdTensor::from_vec(&[1, 1, 1, 1], vec![2.0]).unwrap();
+        let input_gradient = tied.max_pool2d_backward(&output_gradient, 2, 2, 0);
+        assert_eq!(input_gradient.to_vec(), vec![2.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn flatten_features_preserves_the_batch_axis() {
+        let input =
+            NdTensor::from_vec(&[2, 1, 2, 2], (0..8).map(|value| value as f32).collect()).unwrap();
+
+        let flattened = input.flatten_features();
+
+        assert_eq!(flattened.shape(), &[2, 4]);
+        assert_eq!(flattened.reshape(input.shape()).to_vec(), input.to_vec());
     }
 
     #[test]

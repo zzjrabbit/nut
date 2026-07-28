@@ -470,6 +470,23 @@ impl Graph {
                 };
                 (*input).clone()
             }
+            "Flatten" => {
+                let [input] = input_shapes.as_slice() else {
+                    return Err(GraphError::invalid(
+                        "operator \"Flatten\" requires exactly one input",
+                    ));
+                };
+                if input.dimensions().is_empty() {
+                    return Err(GraphError::invalid("Flatten input cannot be scalar"));
+                }
+                let feature_count =
+                    input.dimensions().iter().try_fold(1usize, |count, value| {
+                        count.checked_mul(*value).ok_or_else(|| {
+                            GraphError::invalid("Flatten input feature count overflows")
+                        })
+                    })?;
+                Shape::new(vec![feature_count])
+            }
             "Add" => {
                 let [left, right] = input_shapes.as_slice() else {
                     return Err(GraphError::invalid(
@@ -509,6 +526,77 @@ impl Graph {
                     .last_mut()
                     .expect("MatMul left shape is non-empty") = *right_out;
                 Shape::new(dimensions)
+            }
+            "Conv2d" => {
+                let [input, weight, bias] = input_shapes.as_slice() else {
+                    return Err(GraphError::invalid(
+                        "operator \"Conv2d\" requires exactly three inputs",
+                    ));
+                };
+                let [input_channels, input_height, input_width] = input.dimensions() else {
+                    return Err(GraphError::invalid(
+                        "Conv2d input must have shape [channels, height, width]",
+                    ));
+                };
+                let [out_channels, weight_channels, kernel_height, kernel_width] =
+                    weight.dimensions()
+                else {
+                    return Err(GraphError::invalid(
+                        "Conv2d weight must have shape [out_channels, in_channels, kernel_height, kernel_width]",
+                    ));
+                };
+                if kernel_height != kernel_width {
+                    return Err(GraphError::invalid("Conv2d requires square kernels"));
+                }
+                if input_channels != weight_channels {
+                    return Err(GraphError::invalid(format!(
+                        "Conv2d input has {input_channels} channels but weight expects {weight_channels}"
+                    )));
+                }
+                if bias.dimensions() != [*out_channels] {
+                    return Err(GraphError::invalid(format!(
+                        "Conv2d bias must have shape [{out_channels}], got {:?}",
+                        bias.dimensions()
+                    )));
+                }
+                let stride = primitive_usize_attribute(node.primitive(), "stride")?;
+                if stride == 0 {
+                    return Err(GraphError::invalid(
+                        "Conv2d stride must be greater than zero",
+                    ));
+                }
+                let padding = primitive_usize_attribute(node.primitive(), "padding")?;
+                let output_height = convolution_output_size(
+                    *input_height,
+                    *kernel_height,
+                    stride,
+                    padding,
+                    "height",
+                )?;
+                let output_width =
+                    convolution_output_size(*input_width, *kernel_width, stride, padding, "width")?;
+                Shape::new(vec![*out_channels, output_height, output_width])
+            }
+            "MaxPool2d" => {
+                let [input] = input_shapes.as_slice() else {
+                    return Err(GraphError::invalid(
+                        "operator \"MaxPool2d\" requires exactly one input",
+                    ));
+                };
+                let [channels, input_height, input_width] = input.dimensions() else {
+                    return Err(GraphError::invalid(
+                        "MaxPool2d input must have shape [channels, height, width]",
+                    ));
+                };
+                let kernel_size = primitive_usize_attribute(node.primitive(), "kernel_size")?;
+                let stride = primitive_usize_attribute(node.primitive(), "stride")?;
+                let padding = primitive_usize_attribute(node.primitive(), "padding")?;
+                validate_max_pool2d_attributes(kernel_size, stride, padding)?;
+                let output_height =
+                    max_pool2d_output_size(*input_height, kernel_size, stride, padding, "height")?;
+                let output_width =
+                    max_pool2d_output_size(*input_width, kernel_size, stride, padding, "width")?;
+                Shape::new(vec![*channels, output_height, output_width])
             }
             _ => return Ok(()),
         };
@@ -596,17 +684,108 @@ impl Graph {
     }
 }
 
+fn primitive_usize_attribute(primitive: &Primitive, name: &str) -> Result<usize, GraphError> {
+    match primitive.attribute(name) {
+        Some(AttributeValue::Unsigned(value)) => usize::try_from(*value).map_err(|_| {
+            GraphError::invalid(format!(
+                "{} attribute {name:?} is too large",
+                primitive.name()
+            ))
+        }),
+        Some(AttributeValue::Integer(value)) if *value >= 0 => Ok(*value as usize),
+        Some(_) => Err(GraphError::invalid(format!(
+            "{} attribute {name:?} must be a non-negative integer",
+            primitive.name()
+        ))),
+        None => Err(GraphError::invalid(format!(
+            "{} is missing required attribute {name:?}",
+            primitive.name()
+        ))),
+    }
+}
+
+fn validate_max_pool2d_attributes(
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<(), GraphError> {
+    if kernel_size == 0 || stride == 0 {
+        return Err(GraphError::invalid(
+            "MaxPool2d kernel_size and stride must be greater than zero",
+        ));
+    }
+    if padding > kernel_size / 2 {
+        return Err(GraphError::invalid(
+            "MaxPool2d padding must not exceed half the kernel_size",
+        ));
+    }
+    Ok(())
+}
+
+fn max_pool2d_output_size(
+    input_size: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    dimension: &str,
+) -> Result<usize, GraphError> {
+    let padded = input_size
+        .checked_add(
+            padding
+                .checked_mul(2)
+                .ok_or_else(|| GraphError::invalid("MaxPool2d padding overflows"))?,
+        )
+        .ok_or_else(|| GraphError::invalid("MaxPool2d padded input size overflows"))?;
+    if kernel_size > padded {
+        return Err(GraphError::invalid(format!(
+            "MaxPool2d kernel size {kernel_size} exceeds padded input {dimension} {padded}"
+        )));
+    }
+    Ok((padded - kernel_size) / stride + 1)
+}
+
+fn convolution_output_size(
+    input_size: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    dimension: &str,
+) -> Result<usize, GraphError> {
+    let padded = input_size
+        .checked_add(
+            padding
+                .checked_mul(2)
+                .ok_or_else(|| GraphError::invalid("Conv2d padding overflows"))?,
+        )
+        .ok_or_else(|| GraphError::invalid("Conv2d padded input size overflows"))?;
+    if kernel_size > padded {
+        return Err(GraphError::invalid(format!(
+            "Conv2d kernel size {kernel_size} exceeds padded input {dimension} {padded}"
+        )));
+    }
+    Ok((padded - kernel_size) / stride + 1)
+}
+
 fn supports_gradient(operator: &str) -> bool {
     matches!(
         operator,
-        "Input" | "Parameter" | "MatMul" | "Add" | "Relu" | "Sigmoid" | "Softmax"
+        "Input"
+            | "Parameter"
+            | "MatMul"
+            | "Add"
+            | "Conv2d"
+            | "MaxPool2d"
+            | "Flatten"
+            | "Relu"
+            | "Sigmoid"
+            | "Softmax"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Linear, Operator, OperatorConfig, Softmax};
+    use crate::{Conv2d, Flatten, Linear, MaxPool2d, Operator, OperatorConfig, Softmax};
 
     fn graph_with_dead_node() -> Graph {
         let mut graph = Graph::named("test");
@@ -633,6 +812,9 @@ mod tests {
             Primitive::parameter(),
             Primitive::mat_mul(),
             Primitive::add(),
+            Primitive::conv2d(),
+            Primitive::max_pool2d(),
+            Primitive::flatten(),
             Primitive::relu(),
             Primitive::sigmoid(),
             Primitive::softmax(),
@@ -645,6 +827,9 @@ mod tests {
                 "Parameter",
                 "MatMul",
                 "Add",
+                "Conv2d",
+                "MaxPool2d",
+                "Flatten",
                 "Relu",
                 "Sigmoid",
                 "Softmax"
@@ -753,6 +938,62 @@ mod tests {
             &[NodeId(4), NodeId(3), NodeId(2), NodeId(1), NodeId(0)]
         );
         assert_eq!(plan.parameters(), graph.parameters());
+    }
+
+    #[test]
+    fn conv2d_lowers_to_trainable_primitive_graph() {
+        let mut graph = Graph::named("Convolutional");
+        let input = graph.add_input("input", Shape::new(vec![3, 8, 8]));
+        let convolution = Conv2d::expand(
+            &mut graph,
+            "features",
+            &[input],
+            &OperatorConfig::new()
+                .with("in_channels", 3usize)
+                .with("out_channels", 4usize)
+                .with("kernel_size", 3usize)
+                .with("stride", 2usize)
+                .with("padding", 1usize),
+        )
+        .unwrap();
+        let pooled = MaxPool2d::expand(
+            &mut graph,
+            "pool",
+            &convolution,
+            &OperatorConfig::new()
+                .with("kernel_size", 2usize)
+                .with("stride", 2usize),
+        )
+        .unwrap();
+        let flattened =
+            Flatten::expand(&mut graph, "flatten", &pooled, &OperatorConfig::new()).unwrap();
+        graph.set_outputs(flattened).unwrap();
+        graph.optimize().unwrap();
+        graph.prepare_training().unwrap();
+
+        let operators: Vec<_> = graph.nodes().map(|node| node.primitive().name()).collect();
+        assert_eq!(
+            operators,
+            [
+                "Input",
+                "Parameter",
+                "Parameter",
+                "Conv2d",
+                "MaxPool2d",
+                "Flatten"
+            ]
+        );
+        let convolution = graph.node(NodeId(3)).unwrap();
+        assert_eq!(convolution.shape().dimensions(), &[4, 4, 4]);
+        assert_eq!(
+            convolution.primitive().attribute("stride"),
+            Some(&AttributeValue::Unsigned(2))
+        );
+        assert_eq!(
+            graph.node(NodeId(4)).unwrap().shape().dimensions(),
+            &[4, 2, 2]
+        );
+        assert_eq!(graph.node(NodeId(5)).unwrap().shape().dimensions(), &[16]);
     }
 
     #[test]

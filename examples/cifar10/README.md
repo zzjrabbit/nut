@@ -1,8 +1,14 @@
 # CIFAR-10 example
 
-This example trains a `3072 -> 128 -> 10` multilayer perceptron with Adam and
-categorical cross entropy. Each 32×32 RGB image from CIFAR-10 is normalized to
-`[0, 1]` and flattened because Nut does not yet provide convolution operators.
+This example trains a compact convolutional classifier with Adam and categorical
+cross entropy. Each 32x32 RGB image stays in NCHW form as `[N, 3, 32, 32]` and
+passes through 16-, 32-, and 64-channel 3x3 convolutions. Two 2x2 max-pooling
+layers progressively reduce the feature maps to 8x8 before a 128-unit
+classification head. Pooling adds local translation tolerance while the smaller
+head limits parameter count. Training batches are shuffled and use random
+4-pixel crops, horizontal flips, channel normalization, and label smoothing.
+The classifier also applies AdamW-style weight decay and a cosine learning-rate
+schedule. Evaluation uses the original image geometry and no label smoothing.
 The example keeps the dataset as bytes in memory and converts only the current
 batch to `f32` values.
 
@@ -12,7 +18,7 @@ Toronto URL remains available as a fallback. It extracts the five training
 batches and one test batch into `examples/cifar10/data`, and reuses valid files
 on later runs.
 
-Run five training epochs with the default settings:
+Run 100 training epochs with the default settings:
 
 ```console
 cargo run -p nut-cifar10-example --release

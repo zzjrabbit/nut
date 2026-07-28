@@ -99,9 +99,72 @@ impl Tensor<f32> {
         }
     }
 
+    pub fn conv2d(&self, weight: &Self, bias: &Self, stride: usize, padding: usize) -> Self {
+        Self {
+            inner: self
+                .inner
+                .conv2d(&weight.inner, &bias.inner, stride, padding),
+        }
+    }
+
+    pub fn conv2d_backward(
+        &self,
+        weight: &Self,
+        gradient: &Self,
+        stride: usize,
+        padding: usize,
+    ) -> (Self, Self, Self) {
+        let (input_gradient, weight_gradient, bias_gradient) =
+            self.inner
+                .conv2d_backward(&weight.inner, &gradient.inner, stride, padding);
+        (
+            Self {
+                inner: input_gradient,
+            },
+            Self {
+                inner: weight_gradient,
+            },
+            Self {
+                inner: bias_gradient,
+            },
+        )
+    }
+
+    pub fn max_pool2d(&self, kernel_size: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            inner: self.inner.max_pool2d(kernel_size, stride, padding),
+        }
+    }
+
+    pub fn max_pool2d_backward(
+        &self,
+        gradient: &Self,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Self {
+        Self {
+            inner: self
+                .inner
+                .max_pool2d_backward(&gradient.inner, kernel_size, stride, padding),
+        }
+    }
+
     pub fn add_tensor(&self, rhs: &Self) -> Self {
         Self {
             inner: self.inner.add_tensor(&rhs.inner),
+        }
+    }
+
+    pub fn flatten_features(&self) -> Self {
+        Self {
+            inner: self.inner.flatten_features(),
+        }
+    }
+
+    pub fn reshape(&self, shape: &[usize]) -> Self {
+        Self {
+            inner: self.inner.reshape(shape),
         }
     }
 

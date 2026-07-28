@@ -9,6 +9,9 @@ use crate::include_model::artifact::NodeArtifact;
 enum PrimitiveOperator {
     MatMul,
     Add,
+    Conv2d,
+    MaxPool2d,
+    Flatten,
     Relu,
     Sigmoid,
     Softmax,
@@ -19,6 +22,9 @@ impl PrimitiveOperator {
         match name {
             "MatMul" => Some(Self::MatMul),
             "Add" => Some(Self::Add),
+            "Conv2d" => Some(Self::Conv2d),
+            "MaxPool2d" => Some(Self::MaxPool2d),
+            "Flatten" => Some(Self::Flatten),
             "Relu" => Some(Self::Relu),
             "Sigmoid" => Some(Self::Sigmoid),
             "Softmax" => Some(Self::Softmax),
@@ -54,6 +60,30 @@ pub(super) fn forward(
                 return Err(arity_error(span, node, 2));
             };
             Ok(quote! { let #binding = #left.add_tensor(&#right); })
+        }
+        PrimitiveOperator::Conv2d => {
+            let [input, weight, bias] = inputs else {
+                return Err(arity_error(span, node, 3));
+            };
+            let (stride, padding) = conv2d_attributes(node, span)?;
+            Ok(quote! {
+                let #binding = #input.conv2d(&#weight, &#bias, #stride, #padding);
+            })
+        }
+        PrimitiveOperator::MaxPool2d => {
+            let [input] = inputs else {
+                return Err(arity_error(span, node, 1));
+            };
+            let (kernel_size, stride, padding) = max_pool2d_attributes(node, span)?;
+            Ok(quote! {
+                let #binding = #input.max_pool2d(#kernel_size, #stride, #padding);
+            })
+        }
+        PrimitiveOperator::Flatten => {
+            let [input] = inputs else {
+                return Err(arity_error(span, node, 1));
+            };
+            Ok(quote! { let #binding = #input.flatten_features(); })
         }
         PrimitiveOperator::Relu => {
             let [input] = inputs else {
@@ -133,6 +163,52 @@ pub(super) fn backward(
                 ],
             ))
         }
+        PrimitiveOperator::Conv2d => {
+            let [input, weight, _bias] = inputs else {
+                return Err(arity_error(span, node, 3));
+            };
+            let (stride, padding) = conv2d_attributes(node, span)?;
+            let input_gradient = next_gradient_ident(gradient_index);
+            let weight_gradient = next_gradient_ident(gradient_index);
+            let bias_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let (#input_gradient, #weight_gradient, #bias_gradient) = #input
+                        .conv2d_backward(&#weight, &#gradient, #stride, #padding);
+                },
+                vec![
+                    (node.inputs[0], input_gradient),
+                    (node.inputs[1], weight_gradient),
+                    (node.inputs[2], bias_gradient),
+                ],
+            ))
+        }
+        PrimitiveOperator::MaxPool2d => {
+            let [input] = inputs else {
+                return Err(arity_error(span, node, 1));
+            };
+            let (kernel_size, stride, padding) = max_pool2d_attributes(node, span)?;
+            let input_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let #input_gradient = #input
+                        .max_pool2d_backward(&#gradient, #kernel_size, #stride, #padding);
+                },
+                vec![(node.inputs[0], input_gradient)],
+            ))
+        }
+        PrimitiveOperator::Flatten => {
+            let [input] = inputs else {
+                return Err(arity_error(span, node, 1));
+            };
+            let input_gradient = next_gradient_ident(gradient_index);
+            Ok((
+                quote! {
+                    let #input_gradient = #gradient.reshape(#input.shape());
+                },
+                vec![(node.inputs[0], input_gradient)],
+            ))
+        }
         PrimitiveOperator::Relu => {
             let [input] = inputs else {
                 return Err(arity_error(span, node, 1));
@@ -172,6 +248,53 @@ pub(super) fn backward(
     }
 }
 
+fn conv2d_attributes(node: &NodeArtifact, span: &LitStr) -> syn::Result<(usize, usize)> {
+    let stride = usize_attribute(node, "stride", span)?;
+    if stride == 0 {
+        return Err(syn::Error::new_spanned(
+            span,
+            "operator \"Conv2d\" requires a non-zero stride",
+        ));
+    }
+    Ok((stride, usize_attribute(node, "padding", span)?))
+}
+
+fn max_pool2d_attributes(node: &NodeArtifact, span: &LitStr) -> syn::Result<(usize, usize, usize)> {
+    let kernel_size = usize_attribute(node, "kernel_size", span)?;
+    let stride = usize_attribute(node, "stride", span)?;
+    if kernel_size == 0 || stride == 0 {
+        return Err(syn::Error::new_spanned(
+            span,
+            "operator \"MaxPool2d\" requires non-zero kernel_size and stride",
+        ));
+    }
+    let padding = usize_attribute(node, "padding", span)?;
+    if padding > kernel_size / 2 {
+        return Err(syn::Error::new_spanned(
+            span,
+            "operator \"MaxPool2d\" padding must not exceed half the kernel_size",
+        ));
+    }
+    Ok((kernel_size, stride, padding))
+}
+
+fn usize_attribute(node: &NodeArtifact, name: &str, span: &LitStr) -> syn::Result<usize> {
+    node.operator
+        .attributes
+        .get(name)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            syn::Error::new_spanned(
+                span,
+                format!(
+                    "operator {:?} requires non-negative integer attribute {name:?}",
+                    node.operator.name
+                ),
+            )
+        })
+}
+
 fn arity_error(span: &LitStr, node: &NodeArtifact, expected: usize) -> syn::Error {
     syn::Error::new_spanned(
         span,
@@ -189,7 +312,16 @@ mod tests {
 
     #[test]
     fn registry_contains_every_differentiable_primitive() {
-        for operator in ["MatMul", "Add", "Relu", "Sigmoid", "Softmax"] {
+        for operator in [
+            "MatMul",
+            "Add",
+            "Conv2d",
+            "MaxPool2d",
+            "Flatten",
+            "Relu",
+            "Sigmoid",
+            "Softmax",
+        ] {
             assert!(
                 PrimitiveOperator::parse(operator).is_some(),
                 "missing primitive operator {operator}"
