@@ -21,6 +21,14 @@ cross-entropy loss and either SGD or Adam for graphs built from `MatMul`, `Add`,
 `Conv2d`, `MaxPool2d`, `Flatten`, `Relu`, `Sigmoid`, and `Softmax`. More losses,
 optimizers, and graph-level performance optimizations are not implemented yet.
 
+The default `rayon` feature runs the ndarray training kernels across the Rayon
+thread pool, while the default `blas` feature uses CBLAS for matrix
+multiplication. The Nix development shell provides an LP64 OpenBLAS build that
+matches Rust's CBLAS bindings; other environments must provide a linkable LP64
+CBLAS implementation. Builds that require the portable single-threaded backend
+can disable both with
+`default-features = false, features = ["ndarray"]`.
+
 ## Example
 
 Add `nut` as both a normal dependency and a build dependency. Define the model

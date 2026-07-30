@@ -31,6 +31,7 @@
             llvmPackages_18.libllvm
             libffi
             libxml2
+            (openblas.override { blas64 = false; })
             (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
           ];
 

@@ -29,5 +29,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
 [features]
-default = ["ndarray"]
+default = ["ndarray", "rayon", "blas"]
 ndarray = ["dep:ndarray"]
+rayon = ["ndarray", "ndarray/rayon"]
+blas = ["ndarray", "ndarray/blas"]

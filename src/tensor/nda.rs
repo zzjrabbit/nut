@@ -1,6 +1,8 @@
 use std::ops::{Add, Mul, Sub};
 
-use ndarray::{Axis, Ix1, Ix2, Ix4, IxDyn};
+#[cfg(feature = "rayon")]
+use ndarray::parallel::prelude::*;
+use ndarray::{Axis, Ix1, Ix2, Ix4, IxDyn, Zip};
 use rand::RngExt;
 use rand_distr::{Distribution, StandardNormal, StandardUniform};
 
@@ -47,7 +49,26 @@ impl NdTensor<f32> {
             rhs.shape()[0],
             "matmul inner dimensions must match",
         );
-        Self::from_inner(lhs.dot(&rhs).into_dyn().into_shared())
+        #[cfg(feature = "blas")]
+        {
+            Self::from_inner(lhs.dot(&rhs).into_dyn().into_shared())
+        }
+        #[cfg(all(not(feature = "blas"), feature = "rayon"))]
+        {
+            let mut output = ndarray::Array2::zeros((lhs.nrows(), rhs.ncols()));
+            output
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .zip(lhs.axis_iter(Axis(0)).into_par_iter())
+                .for_each(|(mut output_row, lhs_row)| {
+                    output_row.assign(&lhs_row.dot(&rhs));
+                });
+            Self::from_inner(output.into_dyn().into_shared())
+        }
+        #[cfg(all(not(feature = "blas"), not(feature = "rayon")))]
+        {
+            Self::from_inner(lhs.dot(&rhs).into_dyn().into_shared())
+        }
     }
 
     pub(crate) fn conv2d(&self, weight: &Self, bias: &Self, stride: usize, padding: usize) -> Self {
@@ -86,39 +107,55 @@ impl NdTensor<f32> {
         );
         let mut output =
             ndarray::Array4::zeros((batch_size, output_channels, output_height, output_width));
-        for batch in 0..batch_size {
-            for output_channel in 0..output_channels {
-                for output_y in 0..output_height {
-                    for output_x in 0..output_width {
-                        let mut value = bias[output_channel];
-                        for input_channel in 0..input_channels {
-                            for kernel_y in 0..kernel_height {
-                                let input_y = output_y * stride + kernel_y;
-                                let Some(input_y) = input_y.checked_sub(padding) else {
-                                    continue;
-                                };
-                                if input_y >= input_height {
-                                    continue;
-                                }
-                                for kernel_x in 0..kernel_width {
-                                    let input_x = output_x * stride + kernel_x;
-                                    let Some(input_x) = input_x.checked_sub(padding) else {
+        let calculate_batch =
+            |(batch, mut batch_output): (usize, ndarray::ArrayViewMut3<'_, f32>)| {
+                for output_channel in 0..output_channels {
+                    for output_y in 0..output_height {
+                        for output_x in 0..output_width {
+                            let mut value = bias[output_channel];
+                            for input_channel in 0..input_channels {
+                                for kernel_y in 0..kernel_height {
+                                    let input_y = output_y * stride + kernel_y;
+                                    let Some(input_y) = input_y.checked_sub(padding) else {
                                         continue;
                                     };
-                                    if input_x >= input_width {
+                                    if input_y >= input_height {
                                         continue;
                                     }
-                                    value += input[[batch, input_channel, input_y, input_x]]
-                                        * weight
-                                            [[output_channel, input_channel, kernel_y, kernel_x]];
+                                    for kernel_x in 0..kernel_width {
+                                        let input_x = output_x * stride + kernel_x;
+                                        let Some(input_x) = input_x.checked_sub(padding) else {
+                                            continue;
+                                        };
+                                        if input_x >= input_width {
+                                            continue;
+                                        }
+                                        value += input[[batch, input_channel, input_y, input_x]]
+                                            * weight[[
+                                                output_channel,
+                                                input_channel,
+                                                kernel_y,
+                                                kernel_x,
+                                            ]];
+                                    }
                                 }
                             }
+                            batch_output[[output_channel, output_y, output_x]] = value;
                         }
-                        output[[batch, output_channel, output_y, output_x]] = value;
                     }
                 }
-            }
-        }
+            };
+        #[cfg(feature = "rayon")]
+        output
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(calculate_batch);
+        #[cfg(not(feature = "rayon"))]
+        output
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(calculate_batch);
         Self::from_inner(output.into_dyn().into_shared())
     }
 
@@ -166,6 +203,108 @@ impl NdTensor<f32> {
         let mut input_gradient = ndarray::Array4::zeros(input.dim());
         let mut weight_gradient = ndarray::Array4::zeros(weight.dim());
         let mut bias_gradient = ndarray::Array1::zeros(output_channels);
+        #[cfg(feature = "rayon")]
+        {
+            input_gradient
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(batch, mut batch_gradient)| {
+                    for output_channel in 0..output_channels {
+                        for output_y in 0..output_height {
+                            for output_x in 0..output_width {
+                                let local_gradient =
+                                    gradient[[batch, output_channel, output_y, output_x]];
+                                for input_channel in 0..input_channels {
+                                    for kernel_y in 0..kernel_height {
+                                        let input_y = output_y * stride + kernel_y;
+                                        let Some(input_y) = input_y.checked_sub(padding) else {
+                                            continue;
+                                        };
+                                        if input_y >= input_height {
+                                            continue;
+                                        }
+                                        for kernel_x in 0..kernel_width {
+                                            let input_x = output_x * stride + kernel_x;
+                                            let Some(input_x) = input_x.checked_sub(padding) else {
+                                                continue;
+                                            };
+                                            if input_x >= input_width {
+                                                continue;
+                                            }
+                                            batch_gradient[[input_channel, input_y, input_x]] +=
+                                                local_gradient
+                                                    * weight[[
+                                                        output_channel,
+                                                        input_channel,
+                                                        kernel_y,
+                                                        kernel_x,
+                                                    ]];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+            weight_gradient
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(output_channel, mut channel_gradient)| {
+                    for batch in 0..batch_size {
+                        for output_y in 0..output_height {
+                            for output_x in 0..output_width {
+                                let local_gradient =
+                                    gradient[[batch, output_channel, output_y, output_x]];
+                                for input_channel in 0..input_channels {
+                                    for kernel_y in 0..kernel_height {
+                                        let input_y = output_y * stride + kernel_y;
+                                        let Some(input_y) = input_y.checked_sub(padding) else {
+                                            continue;
+                                        };
+                                        if input_y >= input_height {
+                                            continue;
+                                        }
+                                        for kernel_x in 0..kernel_width {
+                                            let input_x = output_x * stride + kernel_x;
+                                            let Some(input_x) = input_x.checked_sub(padding) else {
+                                                continue;
+                                            };
+                                            if input_x >= input_width {
+                                                continue;
+                                            }
+                                            channel_gradient
+                                                [[input_channel, kernel_y, kernel_x]] +=
+                                                local_gradient
+                                                    * input
+                                                        [[batch, input_channel, input_y, input_x]];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+            bias_gradient
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(output_channel, mut channel_gradient)| {
+                    let mut sum = 0.0;
+                    for batch in 0..batch_size {
+                        for output_y in 0..output_height {
+                            for output_x in 0..output_width {
+                                sum += gradient[[batch, output_channel, output_y, output_x]];
+                            }
+                        }
+                    }
+                    channel_gradient[[]] = sum;
+                });
+        }
+        #[cfg(not(feature = "rayon"))]
         for batch in 0..batch_size {
             for output_channel in 0..output_channels {
                 for output_y in 0..output_height {
@@ -226,44 +365,56 @@ impl NdTensor<f32> {
             max_pool2d_output_dimensions(input_height, input_width, kernel_size, stride, padding);
         let mut output =
             ndarray::Array4::zeros((batch_size, channels, output_height, output_width));
-        for batch in 0..batch_size {
-            for channel in 0..channels {
-                for output_y in 0..output_height {
-                    for output_x in 0..output_width {
-                        let mut maximum = f32::NEG_INFINITY;
-                        let mut has_maximum = false;
-                        for kernel_y in 0..kernel_size {
-                            let input_y = output_y * stride + kernel_y;
-                            let Some(input_y) = input_y.checked_sub(padding) else {
-                                continue;
-                            };
-                            if input_y >= input_height {
-                                continue;
-                            }
-                            for kernel_x in 0..kernel_size {
-                                let input_x = output_x * stride + kernel_x;
-                                let Some(input_x) = input_x.checked_sub(padding) else {
+        let calculate_batch =
+            |(batch, mut batch_output): (usize, ndarray::ArrayViewMut3<'_, f32>)| {
+                for channel in 0..channels {
+                    for output_y in 0..output_height {
+                        for output_x in 0..output_width {
+                            let mut maximum = f32::NEG_INFINITY;
+                            let mut has_maximum = false;
+                            for kernel_y in 0..kernel_size {
+                                let input_y = output_y * stride + kernel_y;
+                                let Some(input_y) = input_y.checked_sub(padding) else {
                                     continue;
                                 };
-                                if input_x >= input_width {
+                                if input_y >= input_height {
                                     continue;
                                 }
-                                let value = input[[batch, channel, input_y, input_x]];
-                                if !has_maximum || value > maximum {
-                                    maximum = value;
-                                    has_maximum = true;
+                                for kernel_x in 0..kernel_size {
+                                    let input_x = output_x * stride + kernel_x;
+                                    let Some(input_x) = input_x.checked_sub(padding) else {
+                                        continue;
+                                    };
+                                    if input_x >= input_width {
+                                        continue;
+                                    }
+                                    let value = input[[batch, channel, input_y, input_x]];
+                                    if !has_maximum || value > maximum {
+                                        maximum = value;
+                                        has_maximum = true;
+                                    }
                                 }
                             }
+                            assert!(
+                                has_maximum,
+                                "MaxPool2d pooling window must overlap the input"
+                            );
+                            batch_output[[channel, output_y, output_x]] = maximum;
                         }
-                        assert!(
-                            has_maximum,
-                            "MaxPool2d pooling window must overlap the input"
-                        );
-                        output[[batch, channel, output_y, output_x]] = maximum;
                     }
                 }
-            }
-        }
+            };
+        #[cfg(feature = "rayon")]
+        output
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(calculate_batch);
+        #[cfg(not(feature = "rayon"))]
+        output
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(calculate_batch);
         Self::from_inner(output.into_dyn().into_shared())
     }
 
@@ -294,43 +445,55 @@ impl NdTensor<f32> {
         );
 
         let mut input_gradient = ndarray::Array4::zeros(input.dim());
-        for batch in 0..batch_size {
-            for channel in 0..channels {
-                for output_y in 0..output_height {
-                    for output_x in 0..output_width {
-                        let mut maximum = f32::NEG_INFINITY;
-                        let mut maximum_index = None;
-                        for kernel_y in 0..kernel_size {
-                            let input_y = output_y * stride + kernel_y;
-                            let Some(input_y) = input_y.checked_sub(padding) else {
-                                continue;
-                            };
-                            if input_y >= input_height {
-                                continue;
-                            }
-                            for kernel_x in 0..kernel_size {
-                                let input_x = output_x * stride + kernel_x;
-                                let Some(input_x) = input_x.checked_sub(padding) else {
+        let calculate_batch =
+            |(batch, mut batch_gradient): (usize, ndarray::ArrayViewMut3<'_, f32>)| {
+                for channel in 0..channels {
+                    for output_y in 0..output_height {
+                        for output_x in 0..output_width {
+                            let mut maximum = f32::NEG_INFINITY;
+                            let mut maximum_index = None;
+                            for kernel_y in 0..kernel_size {
+                                let input_y = output_y * stride + kernel_y;
+                                let Some(input_y) = input_y.checked_sub(padding) else {
                                     continue;
                                 };
-                                if input_x >= input_width {
+                                if input_y >= input_height {
                                     continue;
                                 }
-                                let value = input[[batch, channel, input_y, input_x]];
-                                if maximum_index.is_none() || value > maximum {
-                                    maximum = value;
-                                    maximum_index = Some((input_y, input_x));
+                                for kernel_x in 0..kernel_size {
+                                    let input_x = output_x * stride + kernel_x;
+                                    let Some(input_x) = input_x.checked_sub(padding) else {
+                                        continue;
+                                    };
+                                    if input_x >= input_width {
+                                        continue;
+                                    }
+                                    let value = input[[batch, channel, input_y, input_x]];
+                                    if maximum_index.is_none() || value > maximum {
+                                        maximum = value;
+                                        maximum_index = Some((input_y, input_x));
+                                    }
                                 }
                             }
+                            let (input_y, input_x) = maximum_index
+                                .expect("MaxPool2d pooling window must overlap the input");
+                            batch_gradient[[channel, input_y, input_x]] +=
+                                gradient[[batch, channel, output_y, output_x]];
                         }
-                        let (input_y, input_x) =
-                            maximum_index.expect("MaxPool2d pooling window must overlap the input");
-                        input_gradient[[batch, channel, input_y, input_x]] +=
-                            gradient[[batch, channel, output_y, output_x]];
                     }
                 }
-            }
-        }
+            };
+        #[cfg(feature = "rayon")]
+        input_gradient
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(calculate_batch);
+        #[cfg(not(feature = "rayon"))]
+        input_gradient
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(calculate_batch);
         Self::from_inner(input_gradient.into_dyn().into_shared())
     }
 
@@ -374,15 +537,13 @@ impl NdTensor<f32> {
     }
 
     pub(crate) fn relu(&self) -> Self {
-        Self::from_inner(self.inner.mapv(|value| value.max(0.0)).into_shared())
+        Self::from_inner(map_values(&self.inner, |value| value.max(0.0)))
     }
 
     pub(crate) fn sigmoid(&self) -> Self {
-        Self::from_inner(
-            self.inner
-                .mapv(|value| 1.0 / (1.0 + (-value).exp()))
-                .into_shared(),
-        )
+        Self::from_inner(map_values(&self.inner, |value| {
+            1.0 / (1.0 + (-value).exp())
+        }))
     }
 
     pub(crate) fn softmax(&self) -> Self {
@@ -399,20 +560,29 @@ impl NdTensor<f32> {
             "softmax requires finite input values"
         );
 
-        let axis = Axis(self.inner.ndim() - 1);
-        let mut output = self.inner.to_owned();
-        for mut lane in output.lanes_mut(axis) {
-            let maximum = lane.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut total = 0.0;
-            for value in &mut lane {
-                *value = (*value - maximum).exp();
-                total += *value;
-            }
-            for value in &mut lane {
-                *value /= total;
-            }
-        }
-        Self::from_inner(output.into_shared())
+        let original_shape = self.inner.raw_dim();
+        let class_count = self.inner.shape()[self.inner.ndim() - 1];
+        let sample_count = self.inner.len() / class_count;
+        let mut output = self
+            .inner
+            .to_owned()
+            .into_shape_with_order((sample_count, class_count))
+            .expect("softmax reshape preserves tensor size");
+        #[cfg(feature = "rayon")]
+        output
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(normalize_softmax_lane);
+        #[cfg(not(feature = "rayon"))]
+        output
+            .axis_iter_mut(Axis(0))
+            .for_each(normalize_softmax_lane);
+        Self::from_inner(
+            output
+                .into_shape_with_order(original_shape)
+                .expect("softmax output shape is unchanged")
+                .into_shared(),
+        )
     }
 
     pub(crate) fn transpose_2d(&self) -> Self {
@@ -449,14 +619,22 @@ impl NdTensor<f32> {
 
     pub(crate) fn relu_backward(&self, gradient: &Self) -> Self {
         assert_eq!(self.inner.shape(), gradient.inner.shape());
-        let mask = self.inner.mapv(|value| if value > 0.0 { 1.0 } else { 0.0 });
-        Self::from_inner((mask * &gradient.inner).into_shared())
+        Self::from_inner(zip_values(
+            &self.inner,
+            &gradient.inner,
+            |value, gradient| {
+                if value > 0.0 { gradient } else { 0.0 }
+            },
+        ))
     }
 
     pub(crate) fn sigmoid_backward(&self, gradient: &Self) -> Self {
         assert_eq!(self.inner.shape(), gradient.inner.shape());
-        let local = self.inner.mapv(|value| value * (1.0 - value));
-        Self::from_inner((local * &gradient.inner).into_shared())
+        Self::from_inner(zip_values(
+            &self.inner,
+            &gradient.inner,
+            |value, gradient| value * (1.0 - value) * gradient,
+        ))
     }
 
     pub(crate) fn softmax_backward(&self, gradient: &Self) -> Self {
@@ -469,28 +647,59 @@ impl NdTensor<f32> {
             self.inner.ndim() > 0,
             "softmax backward requires at least one dimension"
         );
-        let axis = Axis(self.inner.ndim() - 1);
-        let mut result = gradient.inner.to_owned();
-        for ((mut result_lane, probability_lane), gradient_lane) in result
-            .lanes_mut(axis)
-            .into_iter()
-            .zip(self.inner.lanes(axis))
-            .zip(gradient.inner.lanes(axis))
-        {
-            let dot = probability_lane
+        let original_shape = self.inner.raw_dim();
+        let class_count = self.inner.shape()[self.inner.ndim() - 1];
+        let sample_count = self.inner.len() / class_count;
+        let probability = self
+            .inner
+            .view()
+            .into_shape_with_order((sample_count, class_count))
+            .expect("softmax output is contiguous");
+        let gradient = gradient
+            .inner
+            .view()
+            .into_shape_with_order((sample_count, class_count))
+            .expect("softmax gradient is contiguous");
+        let mut result = ndarray::Array2::zeros((sample_count, class_count));
+        let calculate_lane = |((mut result, probability), gradient): (
+            (
+                ndarray::ArrayViewMut1<'_, f32>,
+                ndarray::ArrayView1<'_, f32>,
+            ),
+            ndarray::ArrayView1<'_, f32>,
+        )| {
+            let dot = probability
                 .iter()
-                .zip(gradient_lane.iter())
+                .zip(gradient.iter())
                 .map(|(probability, gradient)| probability * gradient)
                 .sum::<f32>();
-            for ((result, probability), gradient) in result_lane
+            for ((result, probability), gradient) in result
                 .iter_mut()
-                .zip(probability_lane.iter())
-                .zip(gradient_lane.iter())
+                .zip(probability.iter())
+                .zip(gradient.iter())
             {
                 *result = probability * (gradient - dot);
             }
-        }
-        Self::from_inner(result.into_shared())
+        };
+        #[cfg(feature = "rayon")]
+        result
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(probability.axis_iter(Axis(0)).into_par_iter())
+            .zip(gradient.axis_iter(Axis(0)).into_par_iter())
+            .for_each(calculate_lane);
+        #[cfg(not(feature = "rayon"))]
+        result
+            .axis_iter_mut(Axis(0))
+            .zip(probability.axis_iter(Axis(0)))
+            .zip(gradient.axis_iter(Axis(0)))
+            .for_each(calculate_lane);
+        Self::from_inner(
+            result
+                .into_shape_with_order(original_shape)
+                .expect("softmax backward output shape is unchanged")
+                .into_shared(),
+        )
     }
 
     pub(crate) fn mse_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
@@ -500,10 +709,10 @@ impl NdTensor<f32> {
             "MSE requires output and target to have the same shape",
         );
         assert!(!self.inner.is_empty(), "MSE requires at least one value");
-        let difference = &self.inner - &target.inner;
+        let difference = zip_values(&self.inner, &target.inner, |output, target| output - target);
         let count = difference.len() as f32;
-        let loss = difference.iter().map(|value| value * value).sum::<f32>() / count;
-        let gradient = difference.mapv(|value| 2.0 * value / count).into_shared();
+        let loss = sum_values(&difference, |value| value * value) / count;
+        let gradient = map_values(&difference, |value| 2.0 * value / count);
         (loss, Self::from_inner(gradient))
     }
 
@@ -533,42 +742,26 @@ impl NdTensor<f32> {
 
         let count = self.inner.len() as f32;
         let epsilon = f32::EPSILON;
-        let probabilities = self.inner.mapv(|value| value.clamp(epsilon, 1.0 - epsilon));
-        let loss = probabilities
-            .iter()
-            .zip(target.inner.iter())
-            .map(|(output, target)| -(target * output.ln() + (1.0 - target) * (1.0 - output).ln()))
-            .sum::<f32>()
-            / count;
-        let gradient = probabilities
-            .iter()
-            .zip(target.inner.iter())
-            .map(|(output, target)| (output - target) / (output * (1.0 - output) * count))
-            .collect::<ndarray::Array1<_>>()
-            .into_shape_with_order(self.inner.raw_dim())
-            .expect("binary cross entropy gradient shape is unchanged")
-            .into_shared();
+        let probabilities = map_values(&self.inner, |value| value.clamp(epsilon, 1.0 - epsilon));
+        let loss = zip_sum_values(&probabilities, &target.inner, |output, target| {
+            -(target * output.ln() + (1.0 - target) * (1.0 - output).ln())
+        }) / count;
+        let gradient = zip_values(&probabilities, &target.inner, |output, target| {
+            (output - target) / (output * (1.0 - output) * count)
+        });
         (loss, Self::from_inner(gradient))
     }
 
     pub(crate) fn categorical_cross_entropy_loss_and_gradient(&self, target: &Self) -> (f32, Self) {
         let class_count = self.validate_categorical_target(target, "categorical cross entropy");
         let sample_count = self.inner.len() / class_count;
-        let probabilities = self.inner.mapv(|value| value.clamp(f32::EPSILON, 1.0));
-        let loss = probabilities
-            .iter()
-            .zip(target.inner.iter())
-            .map(|(output, target)| -target * output.ln())
-            .sum::<f32>()
-            / sample_count as f32;
-        let gradient = probabilities
-            .iter()
-            .zip(target.inner.iter())
-            .map(|(output, target)| -target / (output * sample_count as f32))
-            .collect::<ndarray::Array1<_>>()
-            .into_shape_with_order(self.inner.raw_dim())
-            .expect("categorical cross entropy gradient shape is unchanged")
-            .into_shared();
+        let probabilities = map_values(&self.inner, |value| value.clamp(f32::EPSILON, 1.0));
+        let loss = zip_sum_values(&probabilities, &target.inner, |output, target| {
+            -target * output.ln()
+        }) / sample_count as f32;
+        let gradient = zip_values(&probabilities, &target.inner, |output, target| {
+            -target / (output * sample_count as f32)
+        });
         (loss, Self::from_inner(gradient))
     }
 
@@ -677,12 +870,19 @@ impl NdTensor<f32> {
     }
 
     pub(crate) fn scale(&self, factor: f32) -> Self {
-        Self::from_inner(self.inner.mapv(|value| value * factor).into_shared())
+        Self::from_inner(map_values(&self.inner, |value| value * factor))
     }
 
     pub(crate) fn subtract_scaled(&mut self, gradient: &Self, factor: f32) {
         assert_eq!(self.inner.shape(), gradient.inner.shape());
-        self.inner = (&self.inner - &gradient.inner.mapv(|value| value * factor)).into_shared();
+        #[cfg(feature = "rayon")]
+        Zip::from(&mut self.inner)
+            .and(&gradient.inner)
+            .par_for_each(|parameter, &gradient| *parameter -= gradient * factor);
+        #[cfg(not(feature = "rayon"))]
+        Zip::from(&mut self.inner)
+            .and(&gradient.inner)
+            .for_each(|parameter, &gradient| *parameter -= gradient * factor);
     }
 
     pub(crate) fn adam_update(
@@ -718,26 +918,119 @@ impl NdTensor<f32> {
         );
         assert!(step > 0, "Adam step must be positive");
 
-        first_moment.inner =
-            (&first_moment.inner * BETA_1 + &gradient.inner * (1.0 - BETA_1)).into_shared();
-        second_moment.inner = (&second_moment.inner * BETA_2
-            + gradient.inner.mapv(|value| value * value) * (1.0 - BETA_2))
-            .into_shared();
-
         let step = step as f32;
         let first_correction = 1.0 - BETA_1.powf(step);
         let second_correction = 1.0 - BETA_2.powf(step);
-        let direction = first_moment
-            .inner
-            .iter()
-            .zip(second_moment.inner.iter())
-            .map(|(first, second)| {
-                (first / first_correction) / ((second / second_correction).sqrt() + EPSILON)
-            })
-            .collect::<ndarray::Array1<_>>()
-            .into_shape_with_order(self.inner.raw_dim())
-            .expect("Adam update shape is unchanged");
-        self.inner = (&self.inner - &(direction * learning_rate)).into_shared();
+        let update = |parameter: &mut f32,
+                      &gradient: &f32,
+                      first_moment: &mut f32,
+                      second_moment: &mut f32| {
+            *first_moment = *first_moment * BETA_1 + gradient * (1.0 - BETA_1);
+            *second_moment = *second_moment * BETA_2 + gradient * gradient * (1.0 - BETA_2);
+            let direction = (*first_moment / first_correction)
+                / ((*second_moment / second_correction).sqrt() + EPSILON);
+            *parameter -= learning_rate * direction;
+        };
+        #[cfg(feature = "rayon")]
+        Zip::from(&mut self.inner)
+            .and(&gradient.inner)
+            .and(&mut first_moment.inner)
+            .and(&mut second_moment.inner)
+            .par_for_each(update);
+        #[cfg(not(feature = "rayon"))]
+        Zip::from(&mut self.inner)
+            .and(&gradient.inner)
+            .and(&mut first_moment.inner)
+            .and(&mut second_moment.inner)
+            .for_each(update);
+    }
+}
+
+fn normalize_softmax_lane(mut lane: ndarray::ArrayViewMut1<'_, f32>) {
+    let maximum = lane.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut total = 0.0;
+    for value in &mut lane {
+        *value = (*value - maximum).exp();
+        total += *value;
+    }
+    for value in &mut lane {
+        *value /= total;
+    }
+}
+
+fn map_values<F>(
+    input: &ndarray::ArcArray<f32, IxDyn>,
+    operation: F,
+) -> ndarray::ArcArray<f32, IxDyn>
+where
+    F: Fn(f32) -> f32 + Send + Sync,
+{
+    let mut output = input.to_owned();
+    #[cfg(feature = "rayon")]
+    output.par_mapv_inplace(operation);
+    #[cfg(not(feature = "rayon"))]
+    output.mapv_inplace(operation);
+    output.into_shared()
+}
+
+fn zip_values<F>(
+    lhs: &ndarray::ArcArray<f32, IxDyn>,
+    rhs: &ndarray::ArcArray<f32, IxDyn>,
+    operation: F,
+) -> ndarray::ArcArray<f32, IxDyn>
+where
+    F: Fn(f32, f32) -> f32 + Send + Sync,
+{
+    assert_eq!(lhs.shape(), rhs.shape());
+    let mut output = lhs.to_owned();
+    #[cfg(feature = "rayon")]
+    Zip::from(&mut output)
+        .and(rhs)
+        .par_for_each(|output, &rhs| *output = operation(*output, rhs));
+    #[cfg(not(feature = "rayon"))]
+    Zip::from(&mut output)
+        .and(rhs)
+        .for_each(|output, &rhs| *output = operation(*output, rhs));
+    output.into_shared()
+}
+
+fn sum_values<F>(input: &ndarray::ArcArray<f32, IxDyn>, operation: F) -> f32
+where
+    F: Fn(f32) -> f32 + Send + Sync,
+{
+    #[cfg(feature = "rayon")]
+    {
+        input.par_iter().map(|&value| operation(value)).sum()
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        input.iter().map(|&value| operation(value)).sum()
+    }
+}
+
+fn zip_sum_values<F>(
+    lhs: &ndarray::ArcArray<f32, IxDyn>,
+    rhs: &ndarray::ArcArray<f32, IxDyn>,
+    operation: F,
+) -> f32
+where
+    F: Fn(f32, f32) -> f32 + Send + Sync,
+{
+    assert_eq!(lhs.shape(), rhs.shape());
+    #[cfg(feature = "rayon")]
+    {
+        Zip::from(lhs)
+            .and(rhs)
+            .into_par_iter()
+            .map(|(&lhs, &rhs)| operation(lhs, rhs))
+            .sum()
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(&lhs, &rhs)| operation(lhs, rhs))
+            .sum()
     }
 }
 
